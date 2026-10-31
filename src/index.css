@@ -1,0 +1,158 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-sans: 'Plus Jakarta Sans', 'Gowun Dodum', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #faf8f5;
+    color: #27272a;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* Notebook paper subtle texture lines */
+.bg-notebook-ruled {
+  background-color: #fffdf9;
+  background-image: linear-gradient(0deg, transparent 24px, #f1eae0 25px);
+  background-size: 100% 25px;
+}
+
+/* Doodle border effect */
+.border-doodle {
+  border-width: 2px;
+  border-style: solid;
+  border-color: #1c1917;
+  box-shadow: 3px 3px 0px #1c1917;
+}
+
+.border-doodle-sm {
+  border-width: 1.5px;
+  border-style: solid;
+  border-color: #1c1917;
+  box-shadow: 2px 2px 0px #1c1917;
+}
+
+.border-doodle-amber {
+  border-width: 2px;
+  border-style: solid;
+  border-color: #1c1917;
+  box-shadow: 3px 3px 0px #f59e0b;
+}
+
+/* Subtle vinyl rotation animation */
+@keyframes spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin-slow {
+  animation: spin-slow 8s linear infinite;
+}
+
+/* Doodle dog gentle bounce & rhythm */
+@keyframes doodle-bounce {
+  0%, 100% {
+    transform: translateY(0px) rotate(0deg);
+  }
+  30% {
+    transform: translateY(-8px) rotate(-1.5deg);
+  }
+  60% {
+    transform: translateY(-2px) rotate(1.5deg);
+  }
+  80% {
+    transform: translateY(-5px) rotate(-0.5deg);
+  }
+}
+
+.animate-doodle-bounce {
+  animation: doodle-bounce 1.6s ease-in-out infinite;
+  transform-origin: bottom center;
+}
+
+/* Doodle dog gentle rhythm sway */
+@keyframes doodle-rhythm {
+  0%, 100% {
+    transform: rotate(0deg) scale(1);
+  }
+  25% {
+    transform: rotate(-2deg) scale(1.02);
+  }
+  75% {
+    transform: rotate(2deg) scale(0.99);
+  }
+}
+
+.animate-doodle-rhythm {
+  animation: doodle-rhythm 1.4s ease-in-out infinite;
+  transform-origin: center bottom;
+}
+
+/* Floating musical notes & stars */
+@keyframes note-float-1 {
+  0%, 100% {
+    transform: translateY(0px) rotate(0deg) scale(1);
+    opacity: 0.8;
+  }
+  50% {
+    transform: translateY(-12px) rotate(12deg) scale(1.15);
+    opacity: 1;
+  }
+}
+
+@keyframes note-float-2 {
+  0%, 100% {
+    transform: translateY(0px) rotate(0deg) scale(1);
+    opacity: 0.7;
+  }
+  50% {
+    transform: translateY(-16px) rotate(-10deg) scale(1.2);
+    opacity: 1;
+  }
+}
+
+@keyframes star-twinkle {
+  0%, 100% {
+    transform: scale(0.9) rotate(0deg);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scale(1.25) rotate(15deg);
+    opacity: 1;
+  }
+}
+
+.animate-note-1 {
+  animation: note-float-1 2.2s ease-in-out infinite;
+}
+
+.animate-note-2 {
+  animation: note-float-2 1.8s ease-in-out infinite 0.4s;
+}
+
+.animate-star {
+  animation: star-twinkle 1.5s ease-in-out infinite;
+}
+
+/* Reduced motion preference support */
+@media (prefers-reduced-motion: reduce) {
+  .animate-doodle-bounce,
+  .animate-doodle-rhythm,
+  .animate-note-1,
+  .animate-note-2,
+  .animate-star,
+  .animate-spin-slow,
+  .animate-bounce,
+  .animate-pulse {
+    animation: none !important;
+    transform: none !important;
+  }
+}
