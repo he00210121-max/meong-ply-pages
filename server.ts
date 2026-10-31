@@ -189,6 +189,10 @@ interface GroqCallResult {
 /**
  * Call Groq Cloud API with token metrics and strict JSON formatting
  */
+function groqOutputBudget(count: number): number {
+  return 200 + count * 80;
+}
+
 async function callGroq({
   systemInstruction,
   promptText,
@@ -207,8 +211,8 @@ async function callGroq({
     throw new Error("GROQ_API_KEY 환경변수가 설정되어 있지 않습니다. AI Studio Secrets에서 설정해 주세요.");
   }
 
-  // Safe max_tokens ceiling (Groq free tier has 1,000 OTPM limit)
-  const safeMaxTokens = Math.min(Math.max(maxTokens, 150), 780);
+  // Per-response output allowance; account-wide rate limits are separate.
+  const safeMaxTokens = Math.max(maxTokens, 150);
 
   const requestPayload: any = {
     model: modelName,
@@ -272,7 +276,7 @@ async function callGroq({
       throw new Error("Groq API 인증에 실패했습니다 (401). GROQ_API_KEY 등록 상태를 확인해 주세요.");
     }
     if (response.status === 429) {
-      throw new Error("Groq 무료 사용량 한도(분당 1,000 토큰 제한)에 도달했습니다 (429). 유료 전환 없이 안전하게 보호 중입니다. 약 6~10초 후 다시 시도해 주시거나, 상단의 'Gemini' 모델로 전환해 바로 추천받으실 수 있습니다.");
+      throw new Error("Groq 요청 또는 토큰 사용 한도에 도달했습니다 (429). 잠시 후 다시 시도해 주세요.");
     }
     if (response.status === 503) {
       throw new Error("Groq 서버가 일시적으로 지연되고 있습니다 (503). 잠시 후 다시 시도해 주세요.");
@@ -392,7 +396,7 @@ app.post("/api/recommend", async (req, res) => {
     const cached = recommendationCache.get(cacheKey);
 
     if (cached && Date.now() - cached.createdAt < CACHE_MAX_AGE) {
-      if (cached.data.requestedCount === safeCount && cached.data.songs.length > 0) {
+      if (cached.data.requestedCount === safeCount && cached.data.songs.length === safeCount) {
         console.log(`[멍플리 캐시 적중] 모델: ${model}, 요청: "${cleanedQuery}", 슬라이더: ${safeCount}곡, 반환: ${cached.data.songs.length}곡 (토큰 소모: 0)`);
         res.json({
           ...cached.data,
@@ -491,10 +495,8 @@ ${promptConstraintRules.join("\n")}`;
     const activeModelName = model === "groq" ? "qwen/qwen3.8-27b" : "gemini-3.8-flash";
     const modelProvider = model === "groq" ? "groq" : "gemini";
 
-    // Dynamic token budgeting based on empirical benchmarks (~35 tokens per song + base wrapper)
-    const primaryTokenBudget = model === "groq"
-      ? Math.min(Math.max(safeCount * 36 + 120, 220), 780)
-      : 2048;
+    // Output allowance scales with the song count, independently of the account TPM limit.
+    const primaryTokenBudget = model === "groq" ? groqOutputBudget(safeCount) : 2048;
 
     let rawText = "";
     let initialFinishReason: string | undefined;
@@ -531,7 +533,11 @@ ${promptConstraintRules.join("\n")}`;
       throw new Error(`${activeModelName} 모델 응답 데이터가 비어 있습니다.`);
     }
 
-    let parsedData = parseRobustJson(rawText);
+    let responseComplete = initialFinishReason !== "length";
+    try { JSON.parse(rawText.trim()); } catch { responseComplete = false; }
+    let parsedData: any;
+    try { parsedData = parseRobustJson(rawText); }
+    catch { parsedData = { songs: [] }; responseComplete = false; }
     const initialRawSongs = Array.isArray(parsedData?.songs) ? parsedData.songs : [];
 
     // Requirement 6: Deduplication & Quality Filtering
@@ -541,7 +547,7 @@ ${promptConstraintRules.join("\n")}`;
     const verifiedSongs: SongRecommendation[] = [];
 
     function processSong(song: any) {
-      if (!song.title || !song.artist) return;
+      if (verifiedSongs.length >= safeCount || typeof song?.title !== "string" || typeof song?.artist !== "string" || !song.title.trim() || !song.artist.trim()) return;
       const cleanArtist = song.artist.trim().toLowerCase();
       const trackKey = `${song.title.trim().toLowerCase()}_${cleanArtist}`;
 
@@ -584,15 +590,15 @@ ${promptConstraintRules.join("\n")}`;
     const needed = safeCount - verifiedSongs.length;
     const isTruncated = initialFinishReason === "length";
 
-    if (needed >= 2 && verifiedSongs.length < safeCount) {
-      // Check if Groq token budget allows continuation without hitting 1,000 OTPM
-      const continuationBudget = Math.min(Math.max(needed * 36 + 80, 180), 300);
-      const canRunContinuation = model === "gemini" || (totalCompletionTokens + continuationBudget <= 780);
+    if (needed > 0) {
+      const continuationBudget = groqOutputBudget(needed);
 
-      if (canRunContinuation) {
+
+      {
         console.log(`[적응형 보충 요청] 현재: ${verifiedSongs.length}곡, 부족: ${needed}곡 (잘림 여부: ${isTruncated}) -> 보충 호출`);
-        const existingList = verifiedSongs.slice(0, 12).map(s => `${s.artist} - ${s.title}`).join(", ");
-        const continuationPrompt = `[추가 선곡 요청]
+        const existingList = verifiedSongs.map(s => `${s.artist} - ${s.title}`).join(", ");
+        const continuationPrompt = `${promptText}
+[추가 선곡 요청: 위의 전체 목표 곡 수 대신 아래 부족 곡 수만 반환]
 현재 ${verifiedSongs.length}곡이 선곡되었습니다.
 이미 추천된 다음 곡들과 중복되지 않게 완전히 새로운 실존 곡 ${needed}곡만 추가로 추천해 주세요:
 [이미 추천된 곡]: ${existingList}
@@ -609,6 +615,7 @@ ${promptConstraintRules.join("\n")}`;
               useStrictSchema: false,
             });
             contRawText = contRes.content;
+            if (contRes.finishReason === "length") responseComplete = false;
             if (contRes.usage) {
               totalPromptTokens += contRes.usage.promptTokens;
               totalCompletionTokens += contRes.usage.completionTokens;
@@ -619,12 +626,14 @@ ${promptConstraintRules.join("\n")}`;
               promptText: continuationPrompt,
             });
             contRawText = contRes.content;
+
             if (contRes.usage) {
               totalPromptTokens += contRes.usage.promptTokens;
               totalCompletionTokens += contRes.usage.completionTokens;
             }
           }
 
+          try { JSON.parse(contRawText.trim()); } catch { responseComplete = false; }
           const contParsed = parseRobustJson(contRawText);
           const contSongs = Array.isArray(contParsed?.songs) ? contParsed.songs : [];
           for (const s of contSongs) {
@@ -632,6 +641,7 @@ ${promptConstraintRules.join("\n")}`;
             processSong(s);
           }
         } catch (contErr: any) {
+          responseComplete = false;
           console.warn("[적응형 보충 요청 건너뜀 (기존 곡 반환)]:", contErr?.message || contErr);
         }
       }
@@ -649,11 +659,7 @@ ${promptConstraintRules.join("\n")}`;
     // Honest Shortage & Verification Reporting
     let shortageReason: string | undefined;
     if (verifiedSongs.length < safeCount) {
-      if (model === "groq") {
-        shortageReason = `Groq 무료 플랜의 분당 토큰 안전 상한(1,000 OTPM) 내에서 정밀하게 선곡된 ${verifiedSongs.length}곡을 추천해 드립니다. 더 많은 곡(최대 30곡)은 상단에서 'Gemini' 엔진을 선택하시면 한 번에 추천받으실 수 있습니다.`;
-      } else {
-        shortageReason = `요청하신 조건에 완벽히 부합하는 엄선된 실존 음원 ${verifiedSongs.length}곡을 추천해 드립니다.`;
-      }
+      shortageReason = `요청하신 ${safeCount}곡 중 ${verifiedSongs.length}곡을 표시합니다. 응답이나 중복 제거 과정에서 곡 수가 부족했습니다. 조건을 조정하거나 다시 시도해 주세요.`;
     }
 
     const analysis: AnalysisSummary = {
@@ -712,7 +718,9 @@ ${promptConstraintRules.join("\n")}`;
     };
 
     // Requirement 7: Cache response
-    setLruCache(cacheKey, responseData);
+    if (responseComplete && verifiedSongs.length === safeCount) {
+      setLruCache(cacheKey, responseData);
+    }
 
     console.log(`[멍플리 추천 성공] 모델: ${responseData.modelUsed}, 요청: "${cleanedQuery}", 슬라이더: ${safeCount}곡, 최종: ${responseData.songs.length}곡, 소요시간: ${executionTimeMs}ms, 토큰: 입력 ${tokenUsage.promptTokens} / 출력 ${tokenUsage.completionTokens} (총 ${tokenUsage.totalTokens})`);
 
