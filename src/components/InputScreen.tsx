@@ -14,6 +14,8 @@ interface InputScreenProps {
   initialQuery?: string;
   initialCount?: number;
   initialModel?: RecommendationModel;
+  recentHistoryCount?: number;
+  onClearHistory?: () => void;
 }
 
 const QUICK_EXAMPLES = [
@@ -96,6 +98,8 @@ export const InputScreen: React.FC<InputScreenProps> = ({
   initialQuery = '',
   initialCount = 10,
   initialModel = 'gemini',
+  recentHistoryCount = 0,
+  onClearHistory,
 }) => {
   const [query, setQuery] = useState(initialQuery);
   const [selectedCount, setSelectedCount] = useState<number>(initialCount);
@@ -260,6 +264,25 @@ export const InputScreen: React.FC<InputScreenProps> = ({
                   <p className="leading-snug">
                     문장 속 <strong>"{detectedCountInQuery}곡"</strong>은 무시되며, 슬라이더 설정(<strong>{selectedCount}곡</strong>)이 우선 적용됩니다. (시대 연도는 안전하게 보존)
                   </p>
+                </div>
+              )}
+
+              {recentHistoryCount > 0 && !detectedCountInQuery && (
+                <div className="flex items-center justify-between text-xs text-stone-700 bg-amber-50/60 px-3.5 py-1.5 rounded-xl border border-amber-300">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-sm select-none">🐾</span>
+                    <span>최근 추천받은 <strong>{recentHistoryCount}곡</strong>을 기억하여 중복 없이 새로운 곡을 추천합니다.</span>
+                  </div>
+                  {onClearHistory && (
+                    <button
+                      type="button"
+                      onClick={onClearHistory}
+                      className="text-[11px] underline text-stone-500 hover:text-stone-900 cursor-pointer shrink-0 ml-2"
+                      title="추천 기록을 비우면 처음 상태로 추천받을 수 있습니다"
+                    >
+                      기록 지우기
+                    </button>
+                  )}
                 </div>
               )}
 

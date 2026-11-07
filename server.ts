@@ -1,9 +1,10 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import express from "express";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
+import { normalizeTitle, normalizeArtist, getTrackKey } from "./src/utils/trackHistory.ts";
 
 dotenv.config();
 
@@ -14,14 +15,16 @@ const __dirname = path.dirname(__filename);
 
 app.use(express.json());
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
+function getAiClient() {
+  return new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
     },
-  },
-});
+  });
+}
 
 export interface SongRecommendation {
   number: number;
@@ -322,10 +325,11 @@ async function callGemini({
   promptText: string;
 }): Promise<GeminiCallResult> {
   if (!process.env.GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY 환경변수가 설정되어 있지 않습니다.");
+    throw new Error("GEMINI_API_KEY 환경변수가 설정되어 있지 않습니다. AI Studio 우측 상단의 'Settings > Secrets' 또는 .env 파일에 GEMINI_API_KEY를 등록해 주세요.");
   }
 
-  const candidateModels = ["gemini-3.1-flash-lite", "gemini-3.8-flash"];
+  const ai = getAiClient();
+  const candidateModels = ["gemini-3.8-flash", "gemini-3.1-flash-lite"];
   let lastError: any = null;
 
   for (const modelName of candidateModels) {
@@ -336,7 +340,9 @@ async function callGemini({
         config: {
           systemInstruction,
           responseMimeType: "application/json",
-          temperature: 0.25,
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.LOW,
+          },
         },
       });
 
@@ -376,6 +382,8 @@ app.post("/api/recommend", async (req, res) => {
       popularity = "any",
       coverPreference = "any",
       excludedMusic,
+      excludeHistory = [],
+      forceRefresh = false,
     } = req.body;
 
     if (!query || typeof query !== "string" || !query.trim()) {
@@ -390,26 +398,31 @@ app.post("/api/recommend", async (req, res) => {
     // 2. Clean query
     const { cleanedQuery } = sanitizeMusicQuery(query);
 
-    // 3. Cache lookup (Requirement 7: Server-side caching)
-    const criteriaKey = `${vibe || ''}_${genre || ''}_${era || ''}_${region || ''}_${vocalPreference}_${coverPreference}_${includeAiMusic}_${popularity}_${excludedMusic || ''}`;
-    const cacheKey = `v9_${model}_${cleanedQuery.trim().toLowerCase()}_${safeCount}_${criteriaKey.toLowerCase()}`;
-    const cached = recommendationCache.get(cacheKey);
+    // 3. Cache lookup (Requirement A: Bypass cache on retry/forceRefresh or when history exclusions are provided)
+    const hasHistoryToExclude = Array.isArray(excludeHistory) && excludeHistory.length > 0;
+    const shouldBypassCache = Boolean(forceRefresh) || hasHistoryToExclude;
 
-    if (cached && Date.now() - cached.createdAt < CACHE_MAX_AGE) {
-      if (cached.data.requestedCount === safeCount && cached.data.songs.length === safeCount) {
-        console.log(`[멍플리 캐시 적중] 모델: ${model}, 요청: "${cleanedQuery}", 슬라이더: ${safeCount}곡, 반환: ${cached.data.songs.length}곡 (토큰 소모: 0)`);
-        res.json({
-          ...cached.data,
-          source: 'cache',
-          executionTimeMs: 0,
-          tokenUsage: {
-            promptTokens: 0,
-            completionTokens: 0,
-            totalTokens: 0,
-            isCached: true,
-          }
-        });
-        return;
+    const criteriaKey = `${vibe || ''}_${genre || ''}_${era || ''}_${region || ''}_${vocalPreference}_${coverPreference}_${includeAiMusic}_${popularity}_${excludedMusic || ''}`;
+    const cacheKey = `v10_${model}_${cleanedQuery.trim().toLowerCase()}_${safeCount}_${criteriaKey.toLowerCase()}`;
+
+    if (!shouldBypassCache) {
+      const cached = recommendationCache.get(cacheKey);
+      if (cached && Date.now() - cached.createdAt < CACHE_MAX_AGE) {
+        if (cached.data.requestedCount === safeCount && cached.data.songs.length === safeCount) {
+          console.log(`[멍플리 캐시 적중] 모델: ${model}, 요청: "${cleanedQuery}", 슬라이더: ${safeCount}곡, 반환: ${cached.data.songs.length}곡 (토큰 소모: 0)`);
+          res.json({
+            ...cached.data,
+            source: 'cache',
+            executionTimeMs: 0,
+            tokenUsage: {
+              promptTokens: 0,
+              completionTokens: 0,
+              totalTokens: 0,
+              isCached: true,
+            }
+          });
+          return;
+        }
       }
     }
 
@@ -459,44 +472,85 @@ app.post("/api/recommend", async (req, res) => {
       promptConstraintRules.push("- 보컬: 보컬 가창곡만 선곡.");
     }
 
+    // 5. Candidate oversampling target (e.g. 5 -> 7, 10 -> 13, 15 -> 18, 30 -> 34)
+    const candidateTarget = Math.min(safeCount + 4, Math.ceil(safeCount * 1.25));
+
+    // Build history keys for canonical duplicate checking
+    const historyKeys = new Set<string>();
+    if (Array.isArray(excludeHistory)) {
+      for (const h of excludeHistory) {
+        if (h && typeof h.title === 'string' && typeof h.artist === 'string' && h.title.trim()) {
+          historyKeys.add(getTrackKey(h.title, h.artist));
+        }
+      }
+    }
+
     if (isHiddenRequested) {
       promptConstraintRules.push("- 선곡 풀: [숨은 명곡] 아이유, 임영웅, 성시경, 박효신, BTS 등 대중적인 톱스타 대표곡은 배제하고, 인디 뮤지션 및 숨은 명곡 우선 추천.");
+    } else {
+      promptConstraintRules.push("- 음악 구성: 널리 사랑받는 대표 명곡(약 45%)과 새로운 발견이 되는 숨은 명곡/인디/앨범 수록곡(약 55%)을 조화롭게 교차 선곡할 것.");
     }
 
     if (!isSingleArtistQuery) {
-      promptConstraintRules.push(`- 아티스트 다양성: 동일 아티스트 최대 1~2곡 제한 (서로 다른 아티스트 위주).`);
+      promptConstraintRules.push(`- 아티스트 다양성: 동일 아티스트는 플레이리스트 전체에서 최대 1곡으로 엄격히 제한 (서로 다른 다양한 아티스트 선곡).`);
     }
 
-    promptConstraintRules.push(`- 목표 곡 수: 정확히 ${safeCount}곡 선곡. 토큰 절약을 위해 reason은 5~10단어 내외 분위기 어구로 압축.`);
+    if (historyKeys.size > 0) {
+      const recentFormatted = excludeHistory
+        .slice(0, 30)
+        .map((t: any) => `${t.artist} - ${t.title}`)
+        .join("; ");
+      promptConstraintRules.push(`- 이전 추천 곡 제외: 다음 곡들은 사용자가 이미 최근 추천받았으므로 반드시 배제하고 완전히 새로운 다른 실존 곡만 선곡할 것: [${recentFormatted}]`);
+    }
 
-    // Requirement 2: Streamlined Minimal System Instruction & Schema
-    const systemInstruction = `당신은 실존 음악을 정밀하게 추천하는 전문 AI 큐레이터 '멍플리'입니다.
-가공의 곡이나 유명 가수 이름에 임의의 제목을 조합하는 것을 엄격히 금지합니다.
-토큰 최적화를 위해 불필요한 소개글이나 태그 없이 반드시 다음 간결한 JSON 형식으로만 응답하세요:
+    // Subtle curation angle rotation to ensure fresh explorations across retries
+    const diversityPerspectives = [
+      "대중적인 스테디셀러 명곡과 새로운 매력을 주는 숨은 명작/인디 트랙을 조화롭게 선곡",
+      "다채로운 보컬 음색, 어쿠스틱 악기 편성 및 풍부한 감성의 멜로디라인을 고르게 배치",
+      "시대와 아티스트의 다양성을 극대화하여 진부하지 않은 신선한 트랙 중심 선곡",
+      "감각적인 편곡과 몰입도 높은 사운드스케이프를 자랑하는 다채로운 명곡 탐색",
+    ];
+    const chosenPerspective = diversityPerspectives[Math.floor(Math.random() * diversityPerspectives.length)];
+    promptConstraintRules.push(`- 큐레이션 포커스: ${chosenPerspective}`);
+
+    promptConstraintRules.push(`- 목표 후보 곡 수: 품질 검증 및 다양성 선별을 위해 서로 다른 아티스트의 실존 곡 총 ${candidateTarget}곡을 추천할 것.`);
+
+    // Streamlined Minimal System Instruction & Schema with Diversity Guidelines
+    const systemInstruction = `당신은 실존 음악을 정밀하고 폭넓게 큐레이션하는 전문 AI 음악 큐레이터 '멍플리'입니다.
+가공의 곡이나 존재하지 않는 음원 제목을 임의로 조합하는 행위를 절대 엄격히 금지합니다.
+
+[음악 다양성 및 추천 품질 규칙]
+1. 아티스트 다양성: 동일한 아티스트는 플레이리스트 전체에서 최대 1곡만 선곡하세요.
+2. 대중성과 깊이의 균형:
+   - 누구나 알 만한 대표 인기곡/명곡(약 40~50%)과 취향을 넓혀주는 숨은 명곡/인디/앨범 수록곡(약 50~60%)을 조화롭게 안배하세요.
+   - 특정 유명 가수의 대표곡에만 편중되지 않도록 다양한 뮤지션을 포함하세요.
+3. 조건 적합도: 사용자가 요청한 무드, 장르, 상황, 시대, 보컬 특성을 정확하게 반영하세요.
+4. 이전 추천 제외: [이전 추천 곡 제외] 목록에 포함된 곡은 이미 사용자에게 추천된 곡이므로 절대로 다시 추천하지 마세요.
+
+반드시 다음 간결한 JSON 형식으로만 응답하세요:
 {
-  "title": "플레이리스트 제목 (10자 이내)",
+  "title": "플레이리스트 제목 (15자 이내)",
   "songs": [
     {
-      "title": "실제 곡명",
-      "artist": "실제 아티스트명",
-      "year": "발매연도",
-      "reason": "5~10단어 분위기 어구"
+      "title": "실제 정식 곡명",
+      "artist": "실제 정식 아티스트명",
+      "year": "발매연도 (4자리 숫자)",
+      "popularityTier": "popular" 또는 "hidden",
+      "reason": "요청 분위기와 어울리는 이유 (5~12단어)"
     }
   ]
 }`;
 
     const promptText = `[음악 추천 요청서]
 요청: "${cleanedQuery}"
-요청 곡 수: ${safeCount}곡
+요청 곡 수: ${safeCount}곡 (후보 ${candidateTarget}곡 선곡 요망)
 [필수 반영 지침]
 ${promptConstraintRules.join("\n")}`;
 
-    // Requirement 4 & 8: One-shot Primary Execution with dynamic token budgeting
     const activeModelName = model === "groq" ? "qwen/qwen3.8-27b" : "gemini-3.8-flash";
     const modelProvider = model === "groq" ? "groq" : "gemini";
 
-    // Output allowance scales with the song count, independently of the account TPM limit.
-    const primaryTokenBudget = model === "groq" ? groqOutputBudget(safeCount) : 2048;
+    const primaryTokenBudget = model === "groq" ? groqOutputBudget(candidateTarget) : 3072;
 
     let rawText = "";
     let initialFinishReason: string | undefined;
@@ -540,36 +594,50 @@ ${promptConstraintRules.join("\n")}`;
     catch { parsedData = { songs: [] }; responseComplete = false; }
     const initialRawSongs = Array.isArray(parsedData?.songs) ? parsedData.songs : [];
 
-    // Requirement 6: Deduplication & Quality Filtering
+    // Quality Filtering & Canonical Deduplication
     const seenTracks = new Set<string>();
     const artistCounts = new Map<string, number>();
-    const maxPerArtist = isSingleArtistQuery ? 10 : 2;
+    const maxPerArtist = isSingleArtistQuery ? 10 : (safeCount >= 20 ? 2 : 1);
     const verifiedSongs: SongRecommendation[] = [];
 
     function processSong(song: any) {
       if (verifiedSongs.length >= safeCount || typeof song?.title !== "string" || typeof song?.artist !== "string" || !song.title.trim() || !song.artist.trim()) return;
-      const cleanArtist = song.artist.trim().toLowerCase();
-      const trackKey = `${song.title.trim().toLowerCase()}_${cleanArtist}`;
 
-      if (seenTracks.has(trackKey)) return;
+      const trackKey = getTrackKey(song.title, song.artist);
+      const normArtist = normalizeArtist(song.artist);
 
-      // Filter country violation (if Japan jazz explicitly requested)
-      if (hasExplicitJapan) {
-        const nonJapanese = ["bill evans", "miles davis", "chet baker", "dave brubeck", "john coltrane", "yann tiersen"];
-        if (nonJapanese.some(a => cleanArtist.includes(a))) return;
+      // 1. History exclusion check (bypasses songs user recently heard)
+      if (historyKeys.has(trackKey)) {
+        console.log(`[이전 추천 중복 제외] ${song.artist} - ${song.title}`);
+        return;
       }
 
-      // Filter instrumental violation
+      // 2. Batch deduplication check (including normalized remasters/features)
+      if (seenTracks.has(trackKey)) {
+        console.log(`[동일 배치 중복 제외] ${song.artist} - ${song.title}`);
+        return;
+      }
+
+      // 3. Country / Region filtering
+      if (hasExplicitJapan) {
+        const nonJapanese = ["bill evans", "miles davis", "chet baker", "dave brubeck", "john coltrane", "yann tiersen"];
+        if (nonJapanese.some(a => normArtist.includes(a))) return;
+      }
+
+      // 4. Instrumental filtering
       if (isExplicitInstrumentalRequested && song.isInstrumental === false) {
         return;
       }
 
-      // Artist diversity cap
-      const curCount = artistCounts.get(cleanArtist) || 0;
-      if (curCount >= maxPerArtist) return;
+      // 5. Artist diversity cap (max 1 track per artist, or 2 if >= 20 tracks)
+      const curCount = artistCounts.get(normArtist) || 0;
+      if (curCount >= maxPerArtist) {
+        console.log(`[아티스트 편중 제외] ${song.artist} (이미 ${curCount}곡 포함)`);
+        return;
+      }
 
       seenTracks.add(trackKey);
-      artistCounts.set(cleanArtist, curCount + 1);
+      artistCounts.set(normArtist, curCount + 1);
 
       verifiedSongs.push({
         number: verifiedSongs.length + 1,
@@ -586,64 +654,63 @@ ${promptConstraintRules.join("\n")}`;
       processSong(song);
     }
 
-    // Requirement 5: Adaptive Continuation (부족하거나 잘렸을 때만 추가 요청)
+    // Adaptive Continuation if needed after strict filtering
     const needed = safeCount - verifiedSongs.length;
     const isTruncated = initialFinishReason === "length";
 
     if (needed > 0) {
       const continuationBudget = groqOutputBudget(needed);
+      console.log(`[적응형 보충 요청] 현재: ${verifiedSongs.length}곡, 부족: ${needed}곡 -> 보충 호출`);
+      const existingList = verifiedSongs.map(s => `${s.artist} - ${s.title}`).join(", ");
+      const historyStr = historyKeys.size > 0 ? excludeHistory.slice(0, 20).map((t: any) => `${t.artist} - ${t.title}`).join(", ") : "";
 
-
-      {
-        console.log(`[적응형 보충 요청] 현재: ${verifiedSongs.length}곡, 부족: ${needed}곡 (잘림 여부: ${isTruncated}) -> 보충 호출`);
-        const existingList = verifiedSongs.map(s => `${s.artist} - ${s.title}`).join(", ");
-        const continuationPrompt = `${promptText}
-[추가 선곡 요청: 위의 전체 목표 곡 수 대신 아래 부족 곡 수만 반환]
+      const continuationPrompt = `${promptText}
+[추가 선곡 요청]
 현재 ${verifiedSongs.length}곡이 선곡되었습니다.
-이미 추천된 다음 곡들과 중복되지 않게 완전히 새로운 실존 곡 ${needed}곡만 추가로 추천해 주세요:
-[이미 추천된 곡]: ${existingList}
+이미 선곡된 다음 곡들 및 이전 추천 곡들과 절대 중복되지 않게, 완전히 새로운 실존 곡 ${needed}곡만 추가로 추천해 주세요:
+[이미 선곡된 곡]: ${existingList}
+${historyStr ? `[이전 추천 곡]: ${historyStr}` : ''}
 동일 아티스트 1곡 이하, 실존 곡만 추천하세요.`;
 
-        try {
-          let contRawText = "";
-          if (model === "groq") {
-            const contRes = await callGroq({
-              systemInstruction,
-              promptText: continuationPrompt,
-              modelName: activeModelName,
-              maxTokens: continuationBudget,
-              useStrictSchema: false,
-            });
-            contRawText = contRes.content;
-            if (contRes.finishReason === "length") responseComplete = false;
-            if (contRes.usage) {
-              totalPromptTokens += contRes.usage.promptTokens;
-              totalCompletionTokens += contRes.usage.completionTokens;
-            }
-          } else {
-            const contRes = await callGemini({
-              systemInstruction,
-              promptText: continuationPrompt,
-            });
-            contRawText = contRes.content;
-
-            if (contRes.usage) {
-              totalPromptTokens += contRes.usage.promptTokens;
-              totalCompletionTokens += contRes.usage.completionTokens;
-            }
+      try {
+        let contRawText = "";
+        if (model === "groq") {
+          const contRes = await callGroq({
+            systemInstruction,
+            promptText: continuationPrompt,
+            modelName: activeModelName,
+            maxTokens: continuationBudget,
+            useStrictSchema: false,
+          });
+          contRawText = contRes.content;
+          if (contRes.finishReason === "length") responseComplete = false;
+          if (contRes.usage) {
+            totalPromptTokens += contRes.usage.promptTokens;
+            totalCompletionTokens += contRes.usage.completionTokens;
           }
+        } else {
+          const contRes = await callGemini({
+            systemInstruction,
+            promptText: continuationPrompt,
+          });
+          contRawText = contRes.content;
 
-          try { JSON.parse(contRawText.trim()); } catch { responseComplete = false; }
-          const contParsed = parseRobustJson(contRawText);
-          const contSongs = Array.isArray(contParsed?.songs) ? contParsed.songs : [];
-          for (const s of contSongs) {
-            if (verifiedSongs.length >= safeCount) break;
-            processSong(s);
+          if (contRes.usage) {
+            totalPromptTokens += contRes.usage.promptTokens;
+            totalCompletionTokens += contRes.usage.completionTokens;
           }
-        } catch (contErr: any) {
-          responseComplete = false;
-          console.warn("[적응형 보충 요청 건너뜀 (기존 곡 반환)]:", contErr?.message || contErr);
         }
+
+        try { JSON.parse(contRawText.trim()); } catch { responseComplete = false; }
+        const contParsed = parseRobustJson(contRawText);
+        const contSongs = Array.isArray(contParsed?.songs) ? contParsed.songs : [];
+        for (const s of contSongs) {
+          if (verifiedSongs.length >= safeCount) break;
+          processSong(s);
+        }
+      } catch (contErr: any) {
+        responseComplete = false;
+        console.warn("[적응형 보충 요청 건너뜀 (기존 곡 반환)]:", contErr?.message || contErr);
       }
     }
 
@@ -717,8 +784,8 @@ ${promptConstraintRules.join("\n")}`;
       tokenUsage,
     };
 
-    // Requirement 7: Cache response
-    if (responseComplete && verifiedSongs.length === safeCount) {
+    // Cache response only for clean, non-forced, non-history requests
+    if (responseComplete && verifiedSongs.length === safeCount && !forceRefresh && !hasHistoryToExclude) {
       setLruCache(cacheKey, responseData);
     }
 

@@ -1,5 +1,11 @@
 export type RecommendationModel = 'gemini' | 'groq';
 
+export interface HistoryTrack {
+  title: string;
+  artist: string;
+  timestamp?: number;
+}
+
 export interface DetailedOptions {
   model?: RecommendationModel;
   includeAiMusic?: boolean;
@@ -11,6 +17,7 @@ export interface DetailedOptions {
   popularity?: 'popular' | 'hidden' | 'any';
   coverPreference?: 'original' | 'cover' | 'any';
   excludedMusic?: string;
+  excludeHistory?: HistoryTrack[];
 }
 
 export interface SongItem {

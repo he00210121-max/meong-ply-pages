@@ -11,6 +11,7 @@ import { ResultScreen } from './components/ResultScreen';
 import { ErrorScreen } from './components/ErrorScreen';
 import { InfoModal } from './components/InfoModal';
 import { PlaylistResult, ScreenState, RecommendationModel, DetailedOptions } from './types';
+import { getRecentHistory, saveToHistory, clearHistory } from './utils/trackHistory.ts';
 
 export default function App() {
   const [screen, setScreen] = useState<ScreenState>('input');
@@ -23,6 +24,7 @@ export default function App() {
   const [isInfoOpen, setIsInfoOpen] = useState<boolean>(false);
   const [searchStartTime, setSearchStartTime] = useState<number>(0);
   const [isDone, setIsDone] = useState<boolean>(false);
+  const [recentHistoryCount, setRecentHistoryCount] = useState<number>(() => getRecentHistory().length);
 
   const clientCache = React.useRef<Record<string, PlaylistResult>>({});
 
@@ -37,14 +39,21 @@ export default function App() {
     setModel(targetModel);
     setDetailedOptions(options);
 
-    const optionsKey = `${options.vibe || ''}_${options.genre || ''}_${options.era || ''}_${options.region || ''}_${options.vocalPreference || ''}_${options.coverPreference || ''}_${options.includeAiMusic || ''}_${options.popularity || ''}_${options.excludedMusic || ''}`;
-    const cacheKey = `v8_${targetModel}_${searchQuery.trim().toLowerCase()}_${targetCount}_${optionsKey.toLowerCase()}`;
+    const recentHistory = getRecentHistory();
+    setRecentHistoryCount(recentHistory.length);
 
-    // Instant client-side cache hit (unless forceRefresh)
-    if (!forceRefresh && clientCache.current[cacheKey]) {
+    const optionsKey = `${options.vibe || ''}_${options.genre || ''}_${options.era || ''}_${options.region || ''}_${options.vocalPreference || ''}_${options.coverPreference || ''}_${options.includeAiMusic || ''}_${options.popularity || ''}_${options.excludedMusic || ''}`;
+    const cacheKey = `v10_${targetModel}_${searchQuery.trim().toLowerCase()}_${targetCount}_${optionsKey.toLowerCase()}`;
+
+    // Instant client-side cache hit only on clean, non-force, no-history queries
+    if (!forceRefresh && recentHistory.length === 0 && clientCache.current[cacheKey]) {
       setResult(clientCache.current[cacheKey]);
       setScreen('result');
       return;
+    }
+
+    if (forceRefresh) {
+      delete clientCache.current[cacheKey];
     }
 
     const startTimestamp = Date.now();
@@ -72,6 +81,8 @@ export default function App() {
           popularity: options.popularity,
           coverPreference: options.coverPreference,
           excludedMusic: options.excludedMusic,
+          excludeHistory: recentHistory.slice(0, 30),
+          forceRefresh,
         }),
       });
 
@@ -83,7 +94,15 @@ export default function App() {
       }
 
       const data: PlaylistResult = await response.json();
-      clientCache.current[cacheKey] = data;
+
+      // Remember newly recommended tracks in browser local storage
+      const updatedHistory = saveToHistory(data.songs);
+      setRecentHistoryCount(updatedHistory.length);
+
+      if (!forceRefresh && recentHistory.length === 0) {
+        clientCache.current[cacheKey] = data;
+      }
+
       setIsDone(true);
       setResult(data);
       setScreen('result');
@@ -110,12 +129,19 @@ export default function App() {
     }
   };
 
+  const handleClearHistory = () => {
+    clearHistory();
+    setRecentHistoryCount(0);
+    clientCache.current = {};
+  };
+
   const handleReset = () => {
     setScreen('input');
     setResult(null);
     setErrorMessage('');
     setIsDone(false);
     setSearchStartTime(0);
+    setRecentHistoryCount(getRecentHistory().length);
   };
 
   return (
@@ -134,6 +160,8 @@ export default function App() {
             initialQuery={query}
             initialCount={count}
             initialModel={model}
+            recentHistoryCount={recentHistoryCount}
+            onClearHistory={handleClearHistory}
           />
         )}
 
@@ -152,6 +180,8 @@ export default function App() {
             onReset={handleReset}
             onRetry={handleRetry}
             originalQuery={query}
+            recentHistoryCount={recentHistoryCount}
+            onClearHistory={handleClearHistory}
           />
         )}
 

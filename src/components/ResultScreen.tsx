@@ -7,6 +7,8 @@ interface ResultScreenProps {
   onReset: () => void;
   onRetry: () => void;
   originalQuery: string;
+  recentHistoryCount?: number;
+  onClearHistory?: () => void;
 }
 
 export const ResultScreen: React.FC<ResultScreenProps> = ({
@@ -14,6 +16,8 @@ export const ResultScreen: React.FC<ResultScreenProps> = ({
   onReset,
   onRetry,
   originalQuery,
+  recentHistoryCount = 0,
+  onClearHistory,
 }) => {
   const [copied, setCopied] = useState(false);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
@@ -66,7 +70,24 @@ export const ResultScreen: React.FC<ResultScreenProps> = ({
           <span>다른 분위기 찾아보기</span>
         </button>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {recentHistoryCount > 0 && (
+            <div className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs bg-amber-50 rounded-xl border border-stone-900/60 shadow-[1px_1px_0px_#1c1917] text-stone-700">
+              <span className="select-none">🐾</span>
+              <span>최근 추천 <strong>{recentHistoryCount}곡</strong> 중복 방지 중</span>
+              {onClearHistory && (
+                <button
+                  type="button"
+                  onClick={onClearHistory}
+                  className="ml-1 text-[11px] underline text-stone-500 hover:text-amber-900 cursor-pointer"
+                  title="브라우저에 저장된 최근 추천 곡 목록을 초기화합니다"
+                >
+                  기록 비우기
+                </button>
+              )}
+            </div>
+          )}
+
           <button
             onClick={onRetry}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-stone-800 bg-amber-100 hover:bg-amber-200 rounded-xl border border-stone-900 shadow-[2px_2px_0px_#1c1917] hover:scale-[1.03] active:scale-95 transition-all duration-200 cursor-pointer"
