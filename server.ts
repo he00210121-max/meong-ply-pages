@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import express from "express";
 import dotenv from "dotenv";
@@ -14,6 +15,53 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 app.use(express.json());
+
+app.use((req, res, next) => {
+  const password = process.env.SITE_PASSWORD;
+
+  if (!password) {
+    if (process.env.NODE_ENV === "production") {
+      return res.status(503).send("Password not configured");
+    }
+    return next();
+  }
+
+  const auth = req.headers.authorization ?? "";
+  let authenticated = false;
+
+  if (auth.startsWith("Basic ")) {
+    try {
+      const supplied = Buffer.from(
+        auth.slice(6), "base64"
+      ).toString("utf8");
+
+      const expectedHash = createHash("sha256")
+        .update("meongply:" + password)
+        .digest();
+
+      const suppliedHash = createHash("sha256")
+        .update(supplied)
+        .digest();
+
+      authenticated = timingSafeEqual(
+        expectedHash,
+        suppliedHash
+      );
+    } catch {
+      authenticated = false;
+    }
+  }
+
+  if (authenticated) return next();
+
+  res.setHeader(
+    "WWW-Authenticate",
+    'Basic realm="MeongPly", charset="UTF-8"'
+  );
+
+  return res.status(401).send("Login required");
+});
+
 
 function getAiClient() {
   return new GoogleGenAI({
