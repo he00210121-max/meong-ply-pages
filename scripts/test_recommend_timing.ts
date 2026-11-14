@@ -1,8 +1,10 @@
 ﻿import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
+import { MockUsage } from './mock_gemini_usage.ts';
 
 process.env.NODE_ENV = 'test';
-const { app, configureRecommendationTest } = await import('../server.ts');
+const { app, configureRecommendationTest, configureUsageStoreTest } = await import('../server.ts');
+configureUsageStoreTest(new MockUsage());
 const server = app.listen(0, '127.0.0.1');
 await new Promise<void>(resolve => server.once('listening', resolve));
 const address = server.address();

@@ -315,7 +315,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
                       : 'bg-blue-50 text-blue-950 border-stone-900'
                   }`}>
                     <Cpu className="w-3.5 h-3.5" />
-                    <span>{selectedModel === 'groq' ? 'Groq Qwen 3.8' : 'Gemini 3.8'}</span>
+                    <span>{selectedModel === 'groq' ? 'Groq Qwen 3.8' : 'Gemini'}</span>
                   </div>
                 </div>
 
@@ -384,7 +384,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
                   >
                     <div>
                       <div className="flex items-center gap-1.5 font-bold text-xs text-stone-900">
-                        <span>Gemini 3.8 Flash</span>
+                        <span>Gemini Flash Lite</span>
                         <span className="text-[10px] bg-blue-100 text-blue-900 px-1.5 py-0.2 rounded font-medium">기본 방식</span>
                       </div>
                       <p className="text-[11px] text-stone-600 mt-1">Google AI 기반의 균형 잡힌 음악 추천</p>

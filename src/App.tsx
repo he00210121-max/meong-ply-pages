@@ -241,7 +241,7 @@ export default function App() {
             <span>AI 유튜브 플레이리스트 큐레이터</span>
           </div>
           <div className="text-stone-600 font-mono text-[11px]">
-            Google Gemini 3.8 & Groq Qwen 3.8 듀얼 엔진 지원
+            Google Gemini & Groq Qwen 3.8 듀얼 엔진 지원
           </div>
         </div>
       </footer>

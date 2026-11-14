@@ -1,7 +1,9 @@
 ﻿import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
+import { MockUsage } from './mock_gemini_usage.ts';
 process.env.NODE_ENV = 'test';
-const { app, configureRecommendationTest } = await import('../server.ts');
+const { app, configureRecommendationTest, configureUsageStoreTest } = await import('../server.ts');
+configureUsageStoreTest(new MockUsage());
 const server = app.listen(0, '127.0.0.1');
 await new Promise<void>(resolve => server.once('listening', resolve));
 const addr = server.address();
@@ -31,8 +33,8 @@ try {
     const result = await request(); assert.equal(result.status, code); assert.equal(calls, 1);
     assert.match(result.data.error, code === 429 ? /한도/ : code < 429 ? /인증/ : /지연/);
   }
-  calls = 0; configureRecommendationTest(async () => { calls++; if (calls === 1) throw { status: 404 }; return { content: content(5) }; }, 1000, 100);
-  const fallback = await request(); assert.equal(fallback.status, 200); assert.equal(calls, 2); assert.match(fallback.data.modelUsed, /3.1-flash-lite/);
+  calls = 0; configureRecommendationTest(async () => { calls++; throw { status: 404 }; }, 1000, 100);
+  const missing = await request(); assert.equal(missing.status, 500); assert.equal(calls, 1);
   let entered!: () => void; const enteredPromise = new Promise<void>(r => { entered = r; }); aborted = false;
   configureRecommendationTest(async ({ signal }) => { entered(); signal.addEventListener('abort', () => { aborted = true; }); return new Promise(() => {}); }, 1000, 500);
   const controller = new AbortController(); const pending = request(5, controller.signal).catch(() => undefined);
@@ -41,5 +43,5 @@ try {
   assert(aborted);
   configureRecommendationTest(async () => ({ content: content(5) }), 1000, 100);
   assert.equal((await request()).status, 200);
-  console.log('Gemini mocks: 5/30, delay, no response, 401/403/429/503/504, 404 fallback, cancellation, retry passed');
+  console.log('Gemini mocks: 5/30, delay, no response, 401/403/429/503/504, 404, cancellation, retry passed');
 } finally { server.close(); }

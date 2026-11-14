@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import { randomUUID } from "node:crypto";
 import { createServer as createViteServer } from "vite";
 import { normalizeTitle, normalizeArtist, getTrackKey } from "./src/utils/trackHistory.ts";
+import { usageStore, UsageUnavailable, isDailyRequestQuota, PRIMARY_MODEL, type UsageStore, type Outcome } from './src/server/geminiUsage.ts';
 
 dotenv.config();
 
@@ -332,33 +333,36 @@ async function callGemini({
   signal,
   onAttempt,
   phase,
-  modelState,
 }: {
   systemInstruction: string;
   promptText: string;
   signal?: AbortSignal;
   onAttempt?: () => void;
   phase: 'initial' | 'continuation';
-  modelState: { fallbackUsed: boolean };
 }): Promise<GeminiCallResult> {
   if (!testOverride && !process.env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY 환경변수가 설정되어 있지 않습니다. AI Studio 우측 상단의 'Settings > Secrets' 또는 .env 파일에 GEMINI_API_KEY를 등록해 주세요.");
   }
 
   const ai = testOverride ? undefined : getAiClient();
-  const candidateModels = modelState.fallbackUsed ? ["gemini-3.1-flash-lite"] : ["gemini-3.8-flash", "gemini-3.1-flash-lite"];
-  let lastError: any = null;
-
-  for (const modelName of candidateModels) {
-    if (modelName === 'gemini-3.1-flash-lite') modelState.fallbackUsed = true;
+  const store = testUsageStore ?? usageStore;
+  for (let attemptNumber = 0; attemptNumber < 2; attemptNumber++) {
+    if (signal?.aborted) throw new RecommendationTimeout();
+    const id = randomUUID();
+    const modelName = await store.reserve(id, attemptNumber ? 'retry' : phase);
+    if (signal?.aborted) {
+      await store.finish(id, 'not_sent', 'CANCELLED', false);
+      throw new RecommendationTimeout();
+    }
     const started = performance.now();
     const attempt = new AbortController();
     const cancel = () => attempt.abort();
-    if (signal?.aborted) cancel();
-    else signal?.addEventListener('abort', cancel, { once: true });
+    signal?.addEventListener('abort', cancel, { once: true });
     const timer = setTimeout(() => attempt.abort(), geminiAttemptMs);
-    let errorCode: string | number = 'UNKNOWN';
-    let success = false;
+    let outcome: Outcome = 'error';
+    let errorCode: string | null = 'UNKNOWN';
+    let dailyQuota = false;
+    let failure: any;
     try {
       onAttempt?.();
       const result = await withDeadline(attempt.signal, async (): Promise<GeminiCallResult> => {
@@ -374,25 +378,33 @@ async function callGemini({
         } : undefined };
       });
       if (!result.content) throw new Error('Empty response');
-      success = true;
+      outcome = 'success'; errorCode = null;
       return { ...result, modelName };
     } catch (err: any) {
       const code = Number(err?.status ?? err?.code);
-      errorCode = signal?.aborted ? 'CANCELLED' : attempt.signal.aborted ? 'TIMEOUT' : (Number.isInteger(code) && code >= 400 && code <= 599 ? code : 'UNKNOWN');
-      lastError = errorCode === 'TIMEOUT' ? new RecommendationTimeout() : err;
-      if (signal?.aborted || errorCode !== 404) throw lastError;
+      outcome = signal?.aborted ? 'cancelled' : attempt.signal.aborted ? 'timeout' : 'error';
+      errorCode = outcome === 'cancelled' ? 'CANCELLED' : outcome === 'timeout' ? 'TIMEOUT' : (Number.isInteger(code) && code >= 400 && code <= 599 ? String(code) : 'UNKNOWN');
+      dailyQuota = modelName === PRIMARY_MODEL && isDailyRequestQuota(err);
+      failure = outcome === 'timeout' ? new RecommendationTimeout() : err;
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', cancel);
-      console.info('[gemini request]', { model: modelName, durationMs: Math.round(performance.now() - started), success, errorCode: success ? null : errorCode });
+      console.info('[gemini request]', { model: modelName, durationMs: Math.round(performance.now() - started), success: outcome === 'success', errorCode });
+      await store.finish(id, outcome, errorCode, dailyQuota);
     }
+    if (!dailyQuota || attemptNumber !== 0 || signal?.aborted) throw failure;
   }
-
-  throw lastError || new Error("Gemini AI 응답 데이터가 비어 있습니다.");
+  throw new UsageUnavailable();
 }
 
 type AiOverride = (args: { signal: AbortSignal; phase: 'initial' | 'continuation' }) => Promise<{ content: string; finishReason?: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>;
 let testOverride: AiOverride | undefined;
+let testUsageStore: UsageStore | undefined;
+export function configureUsageStoreTest(store: UsageStore | undefined) {
+  if (process.env.NODE_ENV !== 'test') throw new Error('Test mode only');
+  testUsageStore = store;
+}
+
 let timeoutMs = 150_000;
 let geminiAttemptMs = 25_000;
 export function configureRecommendationTest(override: AiOverride | undefined, deadlineMs = 150_000, attemptMs = 25_000) {
@@ -415,6 +427,42 @@ async function withDeadline<T>(signal: AbortSignal, operation: () => Promise<T>)
   try { return await Promise.race([operation(), timedOut]); }
   finally { signal.removeEventListener('abort', abort); }
 }
+
+// Basic authentication is independent of the public site; keep the secret server-side.
+app.use('/admin/gemini', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  const password = process.env.GEMINI_ADMIN_PASSWORD;
+  if (!password || password.length < 24) { res.status(503).send('관리자 접근 설정이 필요합니다.'); return; }
+  const encoded = req.get('authorization')?.match(/^Basic ([A-Za-z0-9+/=]+)$/i)?.[1];
+  const supplied = encoded ? Buffer.from(encoded, 'base64').toString('utf8') : '';
+  const expectedHash = createHash('sha256').update(`admin:${password}`).digest();
+  const suppliedHash = createHash('sha256').update(supplied).digest();
+  if (!timingSafeEqual(expectedHash, suppliedHash)) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="Gemini admin", charset="UTF-8"');
+    res.status(401).send('관리자 인증이 필요합니다.'); return;
+  }
+  next();
+});
+app.get('/admin/gemini/status', async (_req, res) => {
+  try { res.json(await (testUsageStore ?? usageStore).status()); }
+  catch { res.status(503).json({ error: '사용량 기록에 연결할 수 없습니다.' }); }
+});
+app.post('/admin/gemini/reset', async (req, res) => {
+  if (req.get('X-Requested-With') !== 'meong-admin' || req.get('sec-fetch-site') === 'cross-site') { res.sendStatus(403); return; }
+  try { await (testUsageStore ?? usageStore).reset(); res.json({ ok: true }); }
+  catch { res.status(503).json({ error: '초기화에 실패했습니다. 오늘 기본 모델 500회 도달 여부와 DB 연결을 확인하세요.' }); }
+});
+app.get('/admin/gemini', (_req, res) => {
+  res.type('html').send(`<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>멍플리 관리자</title>
+  <style>body{font-family:sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;line-height:1.7}button{padding:.7rem}pre{white-space:pre-wrap}</style>
+  <h1>Gemini 사용량</h1><p>태평양 시간 기준. 멍플리 외부에서 사용한 호출은 포함되지 않습니다.</p><pre id="status">불러오는 중…</pre>
+  <button id="reset">기본 모델로 초기화</button><p>초기화해도 기록은 삭제되지 않으며, 오늘 기본 모델 500회 제한은 유지됩니다.</p>
+  <script>
+  async function refresh(){const r=await fetch('/admin/gemini/status');const d=await r.json();document.getElementById('status').textContent=r.ok ? '현재 모델: '+d.currentModel+'\\n오늘 현재 모델 호출: '+d.today+'회\\n오늘 기본 모델 호출: '+d.primaryToday+' / 500회\\n전체 호출: '+d.total+'회\\n마지막 전환: '+(d.switchedAt||'없음')+'\\n오류: '+d.errors+'회 / 취소: '+d.cancelled+'회 / 시간 초과: '+d.timeouts+'회\\n재시도: '+d.retries+'회 / 미완료 예약: '+d.pending+'회\\n\\n날짜별 (최근 60개):\\n'+(d.daily||[]).map(x=>x.day+' '+x.model+': '+x.calls+'회 (오류 '+x.errors+', 취소 '+x.cancelled+', 시간 초과 '+x.timeouts+', 재시도 '+x.retries+')').join('\\n') : d.error;}
+  document.getElementById('reset').onclick=async()=>{if(!confirm('기본 모델로 전환하시겠습니까?'))return;const r=await fetch('/admin/gemini/reset',{method:'POST',headers:{'X-Requested-With':'meong-admin'}});if(!r.ok)alert((await r.json()).error);await refresh();};refresh().catch(()=>{document.getElementById('status').textContent='상태를 불러오지 못했습니다.'});
+  </script></html>`);
+});
 
 app.post("/api/recommend", async (req, res) => {
   const startTime = Date.now();
@@ -626,13 +674,12 @@ app.post("/api/recommend", async (req, res) => {
 [필수 반영 지침]
 ${promptConstraintRules.join("\n")}`;
 
-    const activeModelName = model === "groq" ? "qwen/qwen3.8-27b" : "gemini-3.8-flash";
+    const activeModelName = model === "groq" ? "qwen/qwen3.8-27b" : PRIMARY_MODEL;
     const modelProvider = model === "groq" ? "groq" : "gemini";
 
     const primaryTokenBudget = model === "groq" ? groqOutputBudget(candidateTarget) : 3072;
 
-    let usedGeminiModel = "gemini-3.8-flash";
-    const geminiModelState = { fallbackUsed: false };
+    let usedGeminiModel: string = PRIMARY_MODEL;
     let rawText = "";
     let initialFinishReason: string | undefined;
     let totalPromptTokens = 0;
@@ -644,7 +691,7 @@ ${promptConstraintRules.join("\n")}`;
       try {
         return await withDeadline(controller.signal, () => model === 'groq'
             ? (testOverride ? testOverride({ signal: controller.signal, phase }) : callGroq({ systemInstruction, promptText: prompt, modelName: activeModelName, maxTokens: budget, signal: controller.signal }))
-            : callGemini({ systemInstruction, promptText: prompt, signal: controller.signal, phase, modelState: geminiModelState, onAttempt: () => { calls++; } }));
+            : callGemini({ systemInstruction, promptText: prompt, signal: controller.signal, phase, onAttempt: () => { calls++; } }));
       } finally { mark(`${phase}AiEnd`); }
     };
 
@@ -876,13 +923,13 @@ ${historyStr ? `[이전 추천 곡]: ${historyStr}` : ''}
     const executionTimeMs = Date.now() - startTime;
     const timedOut = err instanceof RecommendationTimeout || controller.signal.aborted;
     const providerCode = Number(err?.status ?? err?.code);
-    const status = timedOut ? 504 : logModel === 'gemini' && [401, 403, 429, 503, 504].includes(providerCode) ? providerCode : 500;
+    const status = err instanceof UsageUnavailable ? 503 : timedOut ? 504 : logModel === 'gemini' && [401, 403, 429, 503, 504].includes(providerCode) ? providerCode : 500;
     const message = status === 429 ? 'Gemini 사용량 한도에 도달했어요. 잠시 후 다시 시도해 주세요.'
       : status === 401 || status === 403 ? 'Gemini 인증 또는 사용 권한에 문제가 있어요. 관리자에게 문의해 주세요.'
       : status === 503 || status === 504 ? 'Gemini 응답이 지연되고 있어요. 잠시 후 다시 시도해 주세요.'
       : '음악을 추천하는 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요!';
     res.status(status).json({
-      error: timedOut ? new RecommendationTimeout().message : message,
+      error: err instanceof UsageUnavailable ? err.message : timedOut ? new RecommendationTimeout().message : message,
       executionTimeMs,
     });
   } finally {
