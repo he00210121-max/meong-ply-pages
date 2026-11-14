@@ -102,7 +102,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
   onClearHistory,
 }) => {
   const [query, setQuery] = useState(initialQuery);
-  const [selectedCount, setSelectedCount] = useState<number>(initialCount);
+  const [selectedCount, setSelectedCount] = useState<number>(Math.min(Math.max(initialCount, 5), initialModel === 'groq' ? 10 : 30));
   const [selectedModel, setSelectedModel] = useState<RecommendationModel>(initialModel);
   const [selectedMood, setSelectedMood] = useState<string>('');
   const [selectedGenre, setSelectedGenre] = useState<string>('');
@@ -383,7 +383,10 @@ export const InputScreen: React.FC<InputScreenProps> = ({
 
                   <button
                     type="button"
-                    onClick={() => setSelectedModel('groq')}
+                    onClick={() => {
+                      setSelectedModel('groq');
+                      setSelectedCount(count => Math.min(count, 10));
+                    }}
                     className={`p-3 rounded-xl border-2 text-left transition-all duration-200 flex items-start justify-between cursor-pointer ${
                       selectedModel === 'groq'
                         ? 'bg-orange-50 border-stone-900 shadow-[2px_2px_0px_#1c1917]'
@@ -424,22 +427,31 @@ export const InputScreen: React.FC<InputScreenProps> = ({
                   <input
                     type="range"
                     min={5}
-                    max={30}
+                    max={selectedModel === 'groq' ? 10 : 30}
                     step={1}
                     value={selectedCount}
                     onChange={(e) => setSelectedCount(Number(e.target.value))}
-                    className="w-full h-3 bg-stone-200 rounded-lg appearance-none cursor-pointer accent-amber-500 border border-stone-900/60 focus:outline-none focus:ring-2 focus:ring-amber-400"
-                    aria-label="추천 곡 수 가로 슬라이더 (5곡 ~ 30곡)"
+                    className="song-count-slider w-full h-3 bg-stone-200 rounded-lg appearance-none cursor-pointer accent-amber-500 border border-stone-900/60 focus:outline-none focus:ring-2 focus:ring-amber-400"
+                    aria-label={`추천 곡 수 (5곡 ~ ${selectedModel === 'groq' ? 10 : 30}곡)`}
                   />
-                  <div className="flex justify-between items-center text-[11px] text-stone-500 font-mono mt-1.5 px-0.5">
-                    <span>5곡 (최소)</span>
-                    <span className={selectedCount === 10 ? 'font-bold text-amber-800' : ''}>10곡 (기본)</span>
-                    <span>15곡</span>
-                    <span>20곡</span>
-                    <span>25곡</span>
-                    <span>30곡 (최대)</span>
+                  <div className="relative h-8 mx-2 text-[11px] text-stone-500 font-mono mt-1">
+                    {(selectedModel === 'groq' ? [5, 10] : [5, 10, 15, 20, 25, 30]).map(count => (
+                      <button
+                        key={count}
+                        type="button"
+                        onClick={() => setSelectedCount(count)}
+                        className={`absolute top-0 -translate-x-1/2 px-1 py-1 cursor-pointer ${selectedCount === count ? 'font-bold text-amber-800' : ''}`}
+                        style={{ left: `${((count - 5) / (selectedModel === 'groq' ? 5 : 25)) * 100}%` }}
+                        aria-label={`${count}곡 선택`}
+                      >
+                        {count}
+                      </button>
+                    ))}
                   </div>
                 </div>
+                {selectedModel === 'groq' && (
+                  <p className="text-[11px] text-amber-800 font-medium">Groq는 최대 10곡까지 추천할 수 있어요</p>
+                )}
                 <p className="text-[11px] text-stone-500 leading-normal">
                   💡 입력 문장에 곡 수를 적지 않아도 위 슬라이더의 설정(<strong className="text-stone-800">{selectedCount}곡</strong>)이 AI 추천에 최우선 적용됩니다.
                 </p>

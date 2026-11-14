@@ -395,7 +395,7 @@ app.post("/api/recommend", async (req, res) => {
 
     // 1. Determine target count strictly from slider (5 ~ 30)
     const rawCount = Number(count);
-    const safeCount = Math.min(Math.max(Number.isInteger(rawCount) && rawCount >= 1 ? rawCount : 10, 5), 30);
+    const safeCount = Math.min(Math.max(Number.isInteger(rawCount) && rawCount >= 1 ? rawCount : 10, 5), model === "groq" ? 10 : 30);
 
     // 2. Clean query
     const { cleanedQuery } = sanitizeMusicQuery(query);
@@ -475,7 +475,7 @@ app.post("/api/recommend", async (req, res) => {
     }
 
     // 5. Candidate oversampling target (e.g. 5 -> 7, 10 -> 13, 15 -> 18, 30 -> 34)
-    const candidateTarget = Math.min(safeCount + 4, Math.ceil(safeCount * 1.25));
+    const candidateTarget = model === "groq" ? safeCount : Math.min(safeCount + 4, Math.ceil(safeCount * 1.25));
 
     // Build history keys for canonical duplicate checking
     const historyKeys = new Set<string>();

@@ -1,5 +1,21 @@
 @import "tailwindcss";
 
+.song-count-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #f59e0b;
+}
+
+.song-count-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: 50%;
+  background: #f59e0b;
+}
+
 @layer base {
   :root {
     --font-sans: 'Plus Jakarta Sans', 'Gowun Dodum', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
