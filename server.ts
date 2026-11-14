@@ -3,12 +3,13 @@ import express from "express";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import { randomUUID } from "node:crypto";
 import { createServer as createViteServer } from "vite";
 import { normalizeTitle, normalizeArtist, getTrackKey } from "./src/utils/trackHistory.ts";
 
 dotenv.config();
 
-const app = express();
+export const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -204,12 +205,14 @@ async function callGroq({
   modelName = "qwen/qwen3.8-27b",
   maxTokens = 680,
   useStrictSchema = false,
+  signal,
 }: {
   systemInstruction: string;
   promptText: string;
   modelName?: string;
   maxTokens?: number;
   useStrictSchema?: boolean;
+  signal?: AbortSignal;
 }): Promise<GroqCallResult> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
@@ -265,6 +268,7 @@ async function callGroq({
 
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
+    signal,
     headers: {
       "Authorization": `Bearer ${apiKey}`,
       "Content-Type": "application/json",
@@ -309,6 +313,7 @@ async function callGroq({
 
 interface GeminiCallResult {
   content: string;
+  finishReason?: string;
   usage?: {
     promptTokens: number;
     completionTokens: number;
@@ -322,9 +327,13 @@ interface GeminiCallResult {
 async function callGemini({
   systemInstruction,
   promptText,
+  signal,
+  onAttempt,
 }: {
   systemInstruction: string;
   promptText: string;
+  signal?: AbortSignal;
+  onAttempt?: () => void;
 }): Promise<GeminiCallResult> {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY 환경변수가 설정되어 있지 않습니다. AI Studio 우측 상단의 'Settings > Secrets' 또는 .env 파일에 GEMINI_API_KEY를 등록해 주세요.");
@@ -336,11 +345,13 @@ async function callGemini({
 
   for (const modelName of candidateModels) {
     try {
+      onAttempt?.();
       const response = await ai.models.generateContent({
         model: modelName,
         contents: promptText,
         config: {
           systemInstruction,
+          abortSignal: signal,
           responseMimeType: "application/json",
           thinkingConfig: {
             thinkingLevel: ThinkingLevel.LOW,
@@ -361,15 +372,62 @@ async function callGemini({
       }
     } catch (err: any) {
       lastError = err;
-      console.warn(`[Gemini ${modelName} 시도 실패]:`, err?.message || err);
+      if (signal?.aborted || !(err?.status === 404 || err?.code === 404)) throw err;
     }
   }
 
   throw lastError || new Error("Gemini AI 응답 데이터가 비어 있습니다.");
 }
 
+type AiOverride = (args: { signal: AbortSignal; phase: 'initial' | 'continuation' }) => Promise<{ content: string; finishReason?: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>;
+let testOverride: AiOverride | undefined;
+let timeoutMs = 150_000;
+export function configureRecommendationTest(override: AiOverride | undefined, deadlineMs = 150_000) {
+  if (process.env.NODE_ENV !== 'test') throw new Error('Test configuration is only available in test mode');
+  testOverride = override;
+  timeoutMs = deadlineMs;
+  recommendationCache.clear();
+}
+class RecommendationTimeout extends Error {
+  constructor() { super('음악 추천 시간이 너무 오래 걸렸어요. 잠시 후 다시 시도해 주세요.'); }
+}
+async function withDeadline<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+  if (signal.aborted) throw new RecommendationTimeout();
+  let abort: () => void = () => {};
+  const timedOut = new Promise<never>((_, reject) => {
+    abort = () => reject(new RecommendationTimeout());
+    signal.addEventListener('abort', abort, { once: true });
+  });
+  try { return await Promise.race([operation(), timedOut]); }
+  finally { signal.removeEventListener('abort', abort); }
+}
+
 app.post("/api/recommend", async (req, res) => {
   const startTime = Date.now();
+  const startTick = performance.now();
+  const stages: Record<string, number> = { received: 0 };
+  let calls = 0;
+  const requestId = randomUUID();
+  let logModel: 'gemini' | 'groq' | null = null;
+  let requestedCount: number | null = null;
+  let resultCount = 0;
+  let filteringMs = 0;
+  const mark = (name: string) => { stages[name] = Math.round(performance.now() - startTick); };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let logged = false;
+  const logSummary = () => {
+    if (logged) return;
+    logged = true;
+    mark('responseFinished');
+    const duration = (start: string, end: string) => stages[start] === undefined || stages[end] === undefined ? null : stages[end] - stages[start];
+    console.info('[recommend timing]', { requestId, model: logModel, requestedCount, initialAiMs: duration('initialAiStart', 'initialAiEnd'), continuationMs: duration('continuationAiStart', 'continuationAiEnd'), filteringMs: Math.round(filteringMs), resultCount, totalMs: stages.responseFinished });
+  };
+  res.once('finish', logSummary);
+  res.once('close', () => {
+    if (!res.writableFinished) controller.abort();
+    logSummary();
+  });
   try {
     const {
       query,
@@ -396,6 +454,8 @@ app.post("/api/recommend", async (req, res) => {
     // 1. Determine target count strictly from slider (5 ~ 30)
     const rawCount = Number(count);
     const safeCount = Math.min(Math.max(Number.isInteger(rawCount) && rawCount >= 1 ? rawCount : 10, 5), model === "groq" ? 10 : 30);
+    logModel = model === 'groq' ? 'groq' : 'gemini';
+    requestedCount = safeCount;
 
     // 2. Clean query
     const { cleanedQuery } = sanitizeMusicQuery(query);
@@ -411,11 +471,14 @@ app.post("/api/recommend", async (req, res) => {
       const cached = recommendationCache.get(cacheKey);
       if (cached && Date.now() - cached.createdAt < CACHE_MAX_AGE) {
         if (cached.data.requestedCount === safeCount && cached.data.songs.length === safeCount) {
-          console.log(`[멍플리 캐시 적중] 모델: ${model}, 요청: "${cleanedQuery}", 슬라이더: ${safeCount}곡, 반환: ${cached.data.songs.length}곡 (토큰 소모: 0)`);
+          recommendationCache.delete(cacheKey);
+          recommendationCache.set(cacheKey, cached);
+          mark('cacheHit');
+          resultCount = cached.data.songs.length;
           res.json({
             ...cached.data,
             source: 'cache',
-            executionTimeMs: 0,
+            executionTimeMs: Date.now() - startTime,
             tokenUsage: {
               promptTokens: 0,
               completionTokens: 0,
@@ -559,14 +622,20 @@ ${promptConstraintRules.join("\n")}`;
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
 
+    const runAi = async (phase: 'initial' | 'continuation', prompt: string, budget: number) => {
+      if (testOverride || model === 'groq') calls++;
+      mark(`${phase}AiStart`);
+      try {
+        return await withDeadline(controller.signal, () => testOverride
+          ? testOverride({ signal: controller.signal, phase })
+          : model === 'groq'
+            ? callGroq({ systemInstruction, promptText: prompt, modelName: activeModelName, maxTokens: budget, signal: controller.signal })
+            : callGemini({ systemInstruction, promptText: prompt, signal: controller.signal, onAttempt: () => { calls++; } }));
+      } finally { mark(`${phase}AiEnd`); }
+    };
+
     if (model === "groq") {
-      const groqRes = await callGroq({
-        systemInstruction,
-        promptText,
-        modelName: activeModelName,
-        maxTokens: primaryTokenBudget,
-        useStrictSchema: false,
-      });
+      const groqRes = await runAi('initial', promptText, primaryTokenBudget);
       rawText = groqRes.content;
       initialFinishReason = groqRes.finishReason;
       if (groqRes.usage) {
@@ -574,10 +643,7 @@ ${promptConstraintRules.join("\n")}`;
         totalCompletionTokens = groqRes.usage.completionTokens;
       }
     } else {
-      const geminiRes = await callGemini({
-        systemInstruction,
-        promptText,
-      });
+      const geminiRes = await runAi('initial', promptText, primaryTokenBudget);
       rawText = geminiRes.content;
       if (geminiRes.usage) {
         totalPromptTokens = geminiRes.usage.promptTokens;
@@ -595,6 +661,7 @@ ${promptConstraintRules.join("\n")}`;
     try { parsedData = parseRobustJson(rawText); }
     catch { parsedData = { songs: [] }; responseComplete = false; }
     const initialRawSongs = Array.isArray(parsedData?.songs) ? parsedData.songs : [];
+    mark('initialParseComplete');
 
     // Quality Filtering & Canonical Deduplication
     const seenTracks = new Set<string>();
@@ -610,13 +677,11 @@ ${promptConstraintRules.join("\n")}`;
 
       // 1. History exclusion check (bypasses songs user recently heard)
       if (historyKeys.has(trackKey)) {
-        console.log(`[이전 추천 중복 제외] ${song.artist} - ${song.title}`);
         return;
       }
 
       // 2. Batch deduplication check (including normalized remasters/features)
       if (seenTracks.has(trackKey)) {
-        console.log(`[동일 배치 중복 제외] ${song.artist} - ${song.title}`);
         return;
       }
 
@@ -634,7 +699,6 @@ ${promptConstraintRules.join("\n")}`;
       // 5. Artist diversity cap (max 1 track per artist, or 2 if >= 20 tracks)
       const curCount = artistCounts.get(normArtist) || 0;
       if (curCount >= maxPerArtist) {
-        console.log(`[아티스트 편중 제외] ${song.artist} (이미 ${curCount}곡 포함)`);
         return;
       }
 
@@ -652,17 +716,19 @@ ${promptConstraintRules.join("\n")}`;
       });
     }
 
+    let filterStart = performance.now();
     for (const song of initialRawSongs) {
       processSong(song);
     }
+    filteringMs += performance.now() - filterStart;
 
+    mark('initialFilterComplete');
     // Adaptive Continuation if needed after strict filtering
     const needed = safeCount - verifiedSongs.length;
     const isTruncated = initialFinishReason === "length";
 
     if (needed > 0) {
       const continuationBudget = groqOutputBudget(needed);
-      console.log(`[적응형 보충 요청] 현재: ${verifiedSongs.length}곡, 부족: ${needed}곡 -> 보충 호출`);
       const existingList = verifiedSongs.map(s => `${s.artist} - ${s.title}`).join(", ");
       const historyStr = historyKeys.size > 0 ? excludeHistory.slice(0, 20).map((t: any) => `${t.artist} - ${t.title}`).join(", ") : "";
 
@@ -677,13 +743,7 @@ ${historyStr ? `[이전 추천 곡]: ${historyStr}` : ''}
       try {
         let contRawText = "";
         if (model === "groq") {
-          const contRes = await callGroq({
-            systemInstruction,
-            promptText: continuationPrompt,
-            modelName: activeModelName,
-            maxTokens: continuationBudget,
-            useStrictSchema: false,
-          });
+          const contRes = await runAi('continuation', continuationPrompt, continuationBudget);
           contRawText = contRes.content;
           if (contRes.finishReason === "length") responseComplete = false;
           if (contRes.usage) {
@@ -691,10 +751,7 @@ ${historyStr ? `[이전 추천 곡]: ${historyStr}` : ''}
             totalCompletionTokens += contRes.usage.completionTokens;
           }
         } else {
-          const contRes = await callGemini({
-            systemInstruction,
-            promptText: continuationPrompt,
-          });
+          const contRes = await runAi('continuation', continuationPrompt, continuationBudget);
           contRawText = contRes.content;
 
           if (contRes.usage) {
@@ -706,19 +763,25 @@ ${historyStr ? `[이전 추천 곡]: ${historyStr}` : ''}
         try { JSON.parse(contRawText.trim()); } catch { responseComplete = false; }
         const contParsed = parseRobustJson(contRawText);
         const contSongs = Array.isArray(contParsed?.songs) ? contParsed.songs : [];
+        mark('continuationParseComplete');
+        filterStart = performance.now();
         for (const s of contSongs) {
           if (verifiedSongs.length >= safeCount) break;
           processSong(s);
         }
+        filteringMs += performance.now() - filterStart;
       } catch (contErr: any) {
+        if (contErr instanceof RecommendationTimeout || controller.signal.aborted) throw contErr;
         responseComplete = false;
-        console.warn("[적응형 보충 요청 건너뜀 (기존 곡 반환)]:", contErr?.message || contErr);
       }
     }
 
+    mark('continuationComplete');
+    mark('filterComplete');
     if (verifiedSongs.length === 0) {
       throw new Error("요청 조건에 완벽히 부합하는 실존 곡을 찾지 못했습니다. 조건을 조금 더 넓혀 다시 시도해 주세요.");
     }
+    resultCount = verifiedSongs.length;
 
     // Renumber songs sequentially
     verifiedSongs.forEach((song, idx) => {
@@ -791,16 +854,18 @@ ${historyStr ? `[이전 추천 곡]: ${historyStr}` : ''}
       setLruCache(cacheKey, responseData);
     }
 
-    console.log(`[멍플리 추천 성공] 모델: ${responseData.modelUsed}, 요청: "${cleanedQuery}", 슬라이더: ${safeCount}곡, 최종: ${responseData.songs.length}곡, 소요시간: ${executionTimeMs}ms, 토큰: 입력 ${tokenUsage.promptTokens} / 출력 ${tokenUsage.completionTokens} (총 ${tokenUsage.totalTokens})`);
 
     res.json(responseData);
   } catch (err: any) {
+    if (res.destroyed) return;
     const executionTimeMs = Date.now() - startTime;
-    console.error(`[멍플리 추천 오류] 사유:`, err?.message || err);
-    res.status(500).json({
-      error: err?.message || "음악을 정밀 선곡하는 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요!",
+    const timedOut = err instanceof RecommendationTimeout || controller.signal.aborted;
+    res.status(timedOut ? 504 : 500).json({
+      error: timedOut ? new RecommendationTimeout().message : "음악을 추천하는 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요!",
       executionTimeMs,
     });
+  } finally {
+    clearTimeout(timer);
   }
 });
 
@@ -827,6 +892,6 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
+if (process.env.NODE_ENV !== 'test') startServer().catch((err) => {
   console.error("Failed to start server:", err);
 });

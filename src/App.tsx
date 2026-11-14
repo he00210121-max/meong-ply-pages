@@ -10,10 +10,18 @@ import { LoadingScreen } from './components/LoadingScreen';
 import { ResultScreen } from './components/ResultScreen';
 import { ErrorScreen } from './components/ErrorScreen';
 import { InfoModal } from './components/InfoModal';
+import { Tutorial, TUTORIAL_KEY } from './components/Tutorial';
 import { PlaylistResult, ScreenState, RecommendationModel, DetailedOptions } from './types';
 import { getRecentHistory, saveToHistory, clearHistory } from './utils/trackHistory.ts';
 
 export default function App() {
+  const [tutorialStep, setTutorialStep] = useState<number | null>(() => {
+    try { return localStorage.getItem(TUTORIAL_KEY) ? null : 0; } catch { return 0; }
+  });
+  const finishTutorial = () => {
+    try { localStorage.setItem(TUTORIAL_KEY, 'done'); } catch { /* Storage may be unavailable. */ }
+    setTutorialStep(null);
+  };
   const [screen, setScreen] = useState<ScreenState>('input');
   const [query, setQuery] = useState<string>('');
   const [count, setCount] = useState<number>(10);
@@ -27,11 +35,13 @@ export default function App() {
   const [recentHistoryCount, setRecentHistoryCount] = useState<number>(() => getRecentHistory().length);
 
   const clientCache = React.useRef<Record<string, PlaylistResult>>({});
+  const activeRequest = React.useRef<AbortController | null>(null);
 
   const handleSearch = async (
     params: SearchParams,
     forceRefresh: boolean = false
   ) => {
+    if (activeRequest.current) return;
     const { query: searchQuery, count: targetCount, model: targetModel, options } = params;
 
     setQuery(searchQuery);
@@ -56,7 +66,11 @@ export default function App() {
       delete clientCache.current[cacheKey];
     }
 
-    const startTimestamp = Date.now();
+    const controller = new AbortController();
+    activeRequest.current = controller;
+    let timedOut = false;
+    const deadline = window.setTimeout(() => { timedOut = true; controller.abort(); }, 240_000);
+    const startTimestamp = performance.now();
     setSearchStartTime(startTimestamp);
     setIsDone(false);
     setScreen('loading');
@@ -65,6 +79,7 @@ export default function App() {
     try {
       const response = await fetch('/api/recommend', {
         method: 'POST',
+        signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
         },
@@ -94,12 +109,13 @@ export default function App() {
       }
 
       const data: PlaylistResult = await response.json();
+      if (activeRequest.current !== controller) return;
 
       // Remember newly recommended tracks in browser local storage
       const updatedHistory = saveToHistory(data.songs);
       setRecentHistoryCount(updatedHistory.length);
 
-      if (!forceRefresh && recentHistory.length === 0) {
+      if (!forceRefresh && recentHistory.length === 0 && data.songs.length === targetCount) {
         clientCache.current[cacheKey] = data;
       }
 
@@ -107,9 +123,16 @@ export default function App() {
       setResult(data);
       setScreen('result');
     } catch (err: any) {
-      console.error('추천 실패:', err);
-      setErrorMessage(err?.message || '음악을 추천받는 도중 문제가 발생했습니다.');
+      if (activeRequest.current !== controller) return;
+      setErrorMessage(timedOut ? '응답 시간이 너무 오래 걸렸어요. 잠시 후 다시 시도해 주세요.' : err?.message || '음악을 추천받는 도중 문제가 발생했습니다.');
       setScreen('error');
+    } finally {
+      if (import.meta.env.DEV) {
+        performance.clearMeasures('recommend-browser');
+        performance.measure('recommend-browser', { start: startTimestamp, end: performance.now() });
+      }
+      window.clearTimeout(deadline);
+      if (activeRequest.current === controller) activeRequest.current = null;
     }
   };
 
@@ -136,6 +159,8 @@ export default function App() {
   };
 
   const handleReset = () => {
+    activeRequest.current?.abort();
+    activeRequest.current = null;
     setScreen('input');
     setResult(null);
     setErrorMessage('');
@@ -154,8 +179,10 @@ export default function App() {
 
       {/* Main Content Viewport */}
       <main className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 flex flex-col justify-center">
-        {screen === 'input' && (
+        <div hidden={screen !== 'input'}>
           <InputScreen
+            tutorialStep={tutorialStep}
+            onTutorialInput={() => setTutorialStep(step => step === 1 ? 2 : step)}
             onSearch={handleSearch}
             initialQuery={query}
             initialCount={count}
@@ -163,13 +190,13 @@ export default function App() {
             recentHistoryCount={recentHistoryCount}
             onClearHistory={handleClearHistory}
           />
-        )}
+        </div>
 
         {screen === 'loading' && (
           <LoadingScreen
             query={query}
             count={count}
-            startTime={searchStartTime || Date.now()}
+            startTime={searchStartTime}
             isDone={isDone}
           />
         )}
@@ -199,7 +226,10 @@ export default function App() {
       <InfoModal
         isOpen={isInfoOpen}
         onClose={() => setIsInfoOpen(false)}
+        onTutorial={() => { setIsInfoOpen(false); setScreen('input'); setTutorialStep(0); }}
       />
+
+      {tutorialStep !== null && <Tutorial step={tutorialStep} onStep={setTutorialStep} onFinish={finishTutorial} />}
 
       {/* Quiet Footer */}
       <footer className="mt-auto border-t border-stone-200 py-8 px-4 text-center text-xs text-stone-500">

@@ -16,6 +16,8 @@ interface InputScreenProps {
   initialModel?: RecommendationModel;
   recentHistoryCount?: number;
   onClearHistory?: () => void;
+  tutorialStep?: number | null;
+  onTutorialInput?: () => void;
 }
 
 const QUICK_EXAMPLES = [
@@ -100,6 +102,8 @@ export const InputScreen: React.FC<InputScreenProps> = ({
   initialModel = 'gemini',
   recentHistoryCount = 0,
   onClearHistory,
+  tutorialStep = null,
+  onTutorialInput,
 }) => {
   const [query, setQuery] = useState(initialQuery);
   const [selectedCount, setSelectedCount] = useState<number>(Math.min(Math.max(initialCount, 5), initialModel === 'groq' ? 10 : 30));
@@ -117,6 +121,10 @@ export const InputScreen: React.FC<InputScreenProps> = ({
   const [isOptionsOpen, setIsOptionsOpen] = useState(true);
   const [imgLoaded, setImgLoaded] = useState(true);
 
+  React.useEffect(() => {
+    if (tutorialStep !== null && tutorialStep >= 2 && tutorialStep <= 12) setIsOptionsOpen(true);
+  }, [tutorialStep]);
+
   // Detect accidental song count phrases in query (e.g. '10곡', '20개', '5트랙')
   // Decades like '1990년대', '2000년대', '80년대' do not match because they end with '년대'.
   const detectedCountInQuery = React.useMemo(() => {
@@ -126,7 +134,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!query.trim()) return;
+    if (tutorialStep !== null || !query.trim()) return;
 
     onSearch({
       query: query.trim(),
@@ -192,7 +200,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
 
         <div className="flex flex-col md:flex-row items-center gap-8 md:gap-10">
           {/* Retriever Character Container - Static normally, reacts only on hover */}
-          <div className="shrink-0 flex flex-col items-center group cursor-pointer">
+          <div data-tutorial="intro" className="shrink-0 flex flex-col items-center group cursor-pointer">
             <div className="relative w-48 h-48 sm:w-56 sm:h-56 rounded-2xl bg-amber-50 border-2 border-stone-900 shadow-[4px_4px_0px_#1c1917] overflow-hidden flex items-center justify-center p-2 transition-all duration-200 group-hover:-translate-y-1 group-hover:shadow-[5px_5px_0px_#1c1917] group-active:translate-y-0">
               {imgLoaded ? (
                 <img
@@ -239,8 +247,10 @@ export const InputScreen: React.FC<InputScreenProps> = ({
             <form onSubmit={handleSubmit} className="space-y-3.5">
               <div className="relative">
                 <textarea
+                  data-tutorial="query"
+                  aria-label="?? ?? ??"
                   value={query}
-                  onChange={(e) => setQuery(e.target.value)}
+                  onChange={(e) => { setQuery(e.target.value); if (tutorialStep === 1 && e.target.value) onTutorialInput?.(); }}
                   placeholder="예: 비 오는 새벽에 듣기 좋은 1990년대 일본 재즈 연주곡, 공부할 때 듣는 피아노..."
                   rows={3}
                   className="w-full px-4 py-3.5 text-stone-900 placeholder:text-stone-400 bg-stone-50 rounded-2xl border-2 border-stone-900 shadow-[3px_3px_0px_#1c1917] focus:outline-none focus:bg-white focus:shadow-[4px_4px_0px_#f59e0b] transition-all resize-none text-base"
@@ -311,6 +321,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
 
                 {/* Submit Button with ~3% hover scale per rule 3 */}
                 <button
+                  data-tutorial="submit"
                   type="submit"
                   disabled={!query.trim()}
                   className="w-full sm:w-auto px-7 py-3 bg-amber-400 hover:bg-amber-500 disabled:bg-stone-200 text-stone-900 disabled:text-stone-400 font-extrabold text-base rounded-2xl border-2 border-stone-900 shadow-[4px_4px_0px_#1c1917] hover:shadow-[2px_2px_0px_#1c1917] hover:scale-[1.03] active:scale-95 disabled:hover:scale-100 disabled:shadow-none transition-all duration-200 flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed shrink-0"
@@ -347,10 +358,10 @@ export const InputScreen: React.FC<InputScreenProps> = ({
             </div>
           </button>
 
-          {isOptionsOpen && (
+          {(isOptionsOpen || (tutorialStep !== null && tutorialStep >= 2 && tutorialStep <= 12)) && (
             <div className="mt-4 space-y-4 pt-1">
               {/* 1. Developer Test AI Model Selection (Requirement 1 & 2) */}
-              <div className="bg-stone-50 p-4 rounded-2xl border-2 border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2.5">
+              <div data-tutorial="model" className="bg-stone-50 p-4 rounded-2xl border-2 border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2.5">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <Cpu className="w-4 h-4 text-stone-800" />
@@ -409,7 +420,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
               </div>
 
               {/* 2. Horizontal Slider for Song Count (5~30곡) */}
-              <div className="bg-amber-50/70 p-4 rounded-2xl border-2 border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2">
+              <div data-tutorial="count" className="bg-amber-50/70 p-4 rounded-2xl border-2 border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <SlidersHorizontal className="w-4 h-4 text-amber-700" />
@@ -460,7 +471,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
               {/* 3. Deep Music Criteria Grid: Lyrics/Vocal, Era, Region, Cover, AI Music */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
                 {/* Vocal / Lyrics Preference */}
-                <div className="bg-white p-3.5 rounded-2xl border border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2">
+                <div data-tutorial="vocal" className="bg-white p-3.5 rounded-2xl border border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2">
                   <div className="flex items-center gap-1.5 text-xs font-bold text-stone-800">
                     <Mic2 className="w-3.5 h-3.5 text-amber-700" />
                     <span>가사 및 보컬 설정</span>
@@ -488,7 +499,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
                 </div>
 
                 {/* Cover Song Preference */}
-                <div className="bg-white p-3.5 rounded-2xl border border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2">
+                <div data-tutorial="cover" className="bg-white p-3.5 rounded-2xl border border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2">
                   <div className="flex items-center gap-1.5 text-xs font-bold text-stone-800">
                     <Disc className="w-3.5 h-3.5 text-amber-700" />
                     <span>커버곡 설정</span>
@@ -516,7 +527,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
                 </div>
 
                 {/* Era / Decade Preference */}
-                <div className="bg-white p-3.5 rounded-2xl border border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2">
+                <div data-tutorial="era" className="bg-white p-3.5 rounded-2xl border border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2">
                   <div className="flex items-center gap-1.5 text-xs font-bold text-stone-800">
                     <Sparkles className="w-3.5 h-3.5 text-amber-700" />
                     <span>시대 및 발매 연대</span>
@@ -540,7 +551,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
                 </div>
 
                 {/* Country / Region Preference */}
-                <div className="bg-white p-3.5 rounded-2xl border border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2">
+                <div data-tutorial="region" className="bg-white p-3.5 rounded-2xl border border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-2">
                   <div className="flex items-center gap-1.5 text-xs font-bold text-stone-800">
                     <Globe className="w-3.5 h-3.5 text-amber-700" />
                     <span>국가 및 지역</span>
@@ -567,7 +578,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
               {/* 4. AI Music & Excluded Music Filter */}
               <div className="bg-white p-3.5 rounded-2xl border border-stone-900 shadow-[2px_2px_0px_#1c1917] space-y-3">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <label className="flex items-center gap-2 cursor-pointer select-none text-xs font-bold text-stone-800">
+                  <label data-tutorial="ai" className="flex items-center gap-2 cursor-pointer select-none text-xs font-bold text-stone-800">
                     <input
                       type="checkbox"
                       checked={includeAiMusic}
@@ -600,7 +611,7 @@ export const InputScreen: React.FC<InputScreenProps> = ({
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2 pt-1 border-t border-stone-100">
+                <div data-tutorial="exclude" className="flex items-center gap-2 pt-1 border-t border-stone-100">
                   <Filter className="w-3.5 h-3.5 text-stone-500 shrink-0" />
                   <input
                     type="text"

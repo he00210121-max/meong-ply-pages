@@ -62,6 +62,7 @@ export const Header: React.FC<HeaderProps> = ({ onGoHome, onOpenInfo }) => {
 
         {/* Zone 3: Primary Action */}
         <div className="flex items-center gap-3 shrink-0">
+          <button onClick={onOpenInfo} className="text-xs font-bold underline whitespace-nowrap">???</button>
           <button
             onClick={onGoHome}
             className="flex items-center gap-1.5 px-4 py-2 text-xs sm:text-sm font-bold text-stone-900 bg-amber-300 hover:bg-amber-400 border border-stone-900 rounded-lg shadow-[2px_2px_0px_#1c1917] hover:shadow-[1px_1px_0px_#1c1917] hover:scale-[1.03] active:scale-95 transition-all duration-200 whitespace-nowrap shrink-0 cursor-pointer"
