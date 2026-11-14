@@ -22,6 +22,7 @@ function getAiClient() {
   return new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY,
     httpOptions: {
+      retryOptions: { attempts: 1 },
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -313,6 +314,7 @@ async function callGroq({
 
 interface GeminiCallResult {
   content: string;
+  modelName?: string;
   finishReason?: string;
   usage?: {
     promptTokens: number;
@@ -329,50 +331,60 @@ async function callGemini({
   promptText,
   signal,
   onAttempt,
+  phase,
+  modelState,
 }: {
   systemInstruction: string;
   promptText: string;
   signal?: AbortSignal;
   onAttempt?: () => void;
+  phase: 'initial' | 'continuation';
+  modelState: { fallbackUsed: boolean };
 }): Promise<GeminiCallResult> {
-  if (!process.env.GEMINI_API_KEY) {
+  if (!testOverride && !process.env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY 환경변수가 설정되어 있지 않습니다. AI Studio 우측 상단의 'Settings > Secrets' 또는 .env 파일에 GEMINI_API_KEY를 등록해 주세요.");
   }
 
-  const ai = getAiClient();
-  const candidateModels = ["gemini-3.8-flash", "gemini-3.1-flash-lite"];
+  const ai = testOverride ? undefined : getAiClient();
+  const candidateModels = modelState.fallbackUsed ? ["gemini-3.1-flash-lite"] : ["gemini-3.8-flash", "gemini-3.1-flash-lite"];
   let lastError: any = null;
 
   for (const modelName of candidateModels) {
+    if (modelName === 'gemini-3.1-flash-lite') modelState.fallbackUsed = true;
+    const started = performance.now();
+    const attempt = new AbortController();
+    const cancel = () => attempt.abort();
+    if (signal?.aborted) cancel();
+    else signal?.addEventListener('abort', cancel, { once: true });
+    const timer = setTimeout(() => attempt.abort(), geminiAttemptMs);
+    let errorCode: string | number = 'UNKNOWN';
+    let success = false;
     try {
       onAttempt?.();
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: promptText,
-        config: {
-          systemInstruction,
-          abortSignal: signal,
-          responseMimeType: "application/json",
-          thinkingConfig: {
-            thinkingLevel: ThinkingLevel.LOW,
-          },
-        },
-      });
-
-      if (response && response.text) {
-        const usage = response.usageMetadata ? {
+      const result = await withDeadline(attempt.signal, async (): Promise<GeminiCallResult> => {
+        if (testOverride) return testOverride({ signal: attempt.signal, phase });
+        const response = await ai!.models.generateContent({ model: modelName, contents: promptText, config: {
+          systemInstruction, abortSignal: attempt.signal, responseMimeType: "application/json", automaticContinuation: false,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        } });
+        return { content: response.text || '', usage: response.usageMetadata ? {
           promptTokens: response.usageMetadata.promptTokenCount || 0,
           completionTokens: response.usageMetadata.candidatesTokenCount || 0,
           totalTokens: response.usageMetadata.totalTokenCount || 0,
-        } : undefined;
-        return {
-          content: response.text,
-          usage,
-        };
-      }
+        } : undefined };
+      });
+      if (!result.content) throw new Error('Empty response');
+      success = true;
+      return { ...result, modelName };
     } catch (err: any) {
-      lastError = err;
-      if (signal?.aborted || !(err?.status === 404 || err?.code === 404)) throw err;
+      const code = Number(err?.status ?? err?.code);
+      errorCode = signal?.aborted ? 'CANCELLED' : attempt.signal.aborted ? 'TIMEOUT' : (Number.isInteger(code) && code >= 400 && code <= 599 ? code : 'UNKNOWN');
+      lastError = errorCode === 'TIMEOUT' ? new RecommendationTimeout() : err;
+      if (signal?.aborted || errorCode !== 404) throw lastError;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', cancel);
+      console.info('[gemini request]', { model: modelName, durationMs: Math.round(performance.now() - started), success, errorCode: success ? null : errorCode });
     }
   }
 
@@ -382,10 +394,12 @@ async function callGemini({
 type AiOverride = (args: { signal: AbortSignal; phase: 'initial' | 'continuation' }) => Promise<{ content: string; finishReason?: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }>;
 let testOverride: AiOverride | undefined;
 let timeoutMs = 150_000;
-export function configureRecommendationTest(override: AiOverride | undefined, deadlineMs = 150_000) {
+let geminiAttemptMs = 25_000;
+export function configureRecommendationTest(override: AiOverride | undefined, deadlineMs = 150_000, attemptMs = 25_000) {
   if (process.env.NODE_ENV !== 'test') throw new Error('Test configuration is only available in test mode');
   testOverride = override;
   timeoutMs = deadlineMs;
+  geminiAttemptMs = attemptMs;
   recommendationCache.clear();
 }
 class RecommendationTimeout extends Error {
@@ -414,14 +428,14 @@ app.post("/api/recommend", async (req, res) => {
   let filteringMs = 0;
   const mark = (name: string) => { stages[name] = Math.round(performance.now() - startTick); };
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), req.body?.model === 'groq' ? timeoutMs : Math.min(timeoutMs, 30_000));
   let logged = false;
   const logSummary = () => {
     if (logged) return;
     logged = true;
     mark('responseFinished');
     const duration = (start: string, end: string) => stages[start] === undefined || stages[end] === undefined ? null : stages[end] - stages[start];
-    console.info('[recommend timing]', { requestId, model: logModel, requestedCount, initialAiMs: duration('initialAiStart', 'initialAiEnd'), continuationMs: duration('continuationAiStart', 'continuationAiEnd'), filteringMs: Math.round(filteringMs), resultCount, totalMs: stages.responseFinished });
+    if (logModel !== 'gemini') console.info('[recommend timing]', { requestId, model: logModel, requestedCount, initialAiMs: duration('initialAiStart', 'initialAiEnd'), continuationMs: duration('continuationAiStart', 'continuationAiEnd'), filteringMs: Math.round(filteringMs), resultCount, totalMs: stages.responseFinished });
   };
   res.once('finish', logSummary);
   res.once('close', () => {
@@ -617,20 +631,20 @@ ${promptConstraintRules.join("\n")}`;
 
     const primaryTokenBudget = model === "groq" ? groqOutputBudget(candidateTarget) : 3072;
 
+    let usedGeminiModel = "gemini-3.8-flash";
+    const geminiModelState = { fallbackUsed: false };
     let rawText = "";
     let initialFinishReason: string | undefined;
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
 
     const runAi = async (phase: 'initial' | 'continuation', prompt: string, budget: number) => {
-      if (testOverride || model === 'groq') calls++;
+      if (model === 'groq') calls++;
       mark(`${phase}AiStart`);
       try {
-        return await withDeadline(controller.signal, () => testOverride
-          ? testOverride({ signal: controller.signal, phase })
-          : model === 'groq'
-            ? callGroq({ systemInstruction, promptText: prompt, modelName: activeModelName, maxTokens: budget, signal: controller.signal })
-            : callGemini({ systemInstruction, promptText: prompt, signal: controller.signal, onAttempt: () => { calls++; } }));
+        return await withDeadline(controller.signal, () => model === 'groq'
+            ? (testOverride ? testOverride({ signal: controller.signal, phase }) : callGroq({ systemInstruction, promptText: prompt, modelName: activeModelName, maxTokens: budget, signal: controller.signal }))
+            : callGemini({ systemInstruction, promptText: prompt, signal: controller.signal, phase, modelState: geminiModelState, onAttempt: () => { calls++; } }));
       } finally { mark(`${phase}AiEnd`); }
     };
 
@@ -645,6 +659,7 @@ ${promptConstraintRules.join("\n")}`;
     } else {
       const geminiRes = await runAi('initial', promptText, primaryTokenBudget);
       rawText = geminiRes.content;
+      usedGeminiModel = ('modelName' in geminiRes && typeof geminiRes.modelName === 'string') ? geminiRes.modelName : usedGeminiModel;
       if (geminiRes.usage) {
         totalPromptTokens = geminiRes.usage.promptTokens;
         totalCompletionTokens = geminiRes.usage.completionTokens;
@@ -843,7 +858,7 @@ ${historyStr ? `[이전 추천 곡]: ${historyStr}` : ''}
       verification,
       songs: verifiedSongs,
       executionTimeMs,
-      modelUsed: model === "groq" ? "qwen/qwen3.8-27b (Groq)" : "gemini-3.8-flash (Gemini)",
+      modelUsed: model === "groq" ? "qwen/qwen3.8-27b (Groq)" : `${usedGeminiModel} (Gemini)`,
       modelProvider,
       source: 'ai',
       tokenUsage,
@@ -860,8 +875,14 @@ ${historyStr ? `[이전 추천 곡]: ${historyStr}` : ''}
     if (res.destroyed) return;
     const executionTimeMs = Date.now() - startTime;
     const timedOut = err instanceof RecommendationTimeout || controller.signal.aborted;
-    res.status(timedOut ? 504 : 500).json({
-      error: timedOut ? new RecommendationTimeout().message : "음악을 추천하는 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요!",
+    const providerCode = Number(err?.status ?? err?.code);
+    const status = timedOut ? 504 : logModel === 'gemini' && [401, 403, 429, 503, 504].includes(providerCode) ? providerCode : 500;
+    const message = status === 429 ? 'Gemini 사용량 한도에 도달했어요. 잠시 후 다시 시도해 주세요.'
+      : status === 401 || status === 403 ? 'Gemini 인증 또는 사용 권한에 문제가 있어요. 관리자에게 문의해 주세요.'
+      : status === 503 || status === 504 ? 'Gemini 응답이 지연되고 있어요. 잠시 후 다시 시도해 주세요.'
+      : '음악을 추천하는 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요!';
+    res.status(status).json({
+      error: timedOut ? new RecommendationTimeout().message : message,
       executionTimeMs,
     });
   } finally {

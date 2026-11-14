@@ -69,7 +69,7 @@ export default function App() {
     const controller = new AbortController();
     activeRequest.current = controller;
     let timedOut = false;
-    const deadline = window.setTimeout(() => { timedOut = true; controller.abort(); }, 240_000);
+    const deadline = window.setTimeout(() => { timedOut = true; controller.abort(); }, targetModel === 'gemini' ? 35_000 : 160_000);
     const startTimestamp = performance.now();
     setSearchStartTime(startTimestamp);
     setIsDone(false);
@@ -198,6 +198,7 @@ export default function App() {
             count={count}
             startTime={searchStartTime}
             isDone={isDone}
+            onCancel={handleReset}
           />
         )}
 

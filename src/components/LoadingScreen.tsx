@@ -6,6 +6,7 @@ interface LoadingScreenProps {
   count: number;
   startTime: number;
   isDone?: boolean;
+  onCancel: () => void;
 }
 
 // Exact messages required by user in section 8
@@ -55,6 +56,7 @@ export const LoadingScreen: React.FC<LoadingScreenProps> = ({
   count,
   startTime,
   isDone = false,
+  onCancel,
 }) => {
   const [msgIndex, setMsgIndex] = useState(0);
   const [poseIndex, setPoseIndex] = useState(0);
@@ -64,7 +66,7 @@ export const LoadingScreen: React.FC<LoadingScreenProps> = ({
   // Accurate real elapsed time ticker & smooth estimated progress (Sections 5 & 6)
   useEffect(() => {
     const timer = setInterval(() => {
-      const now = Date.now();
+      const now = performance.now();
       const elapsedMs = Math.max(0, now - startTime);
       const elapsedSec = Math.floor(elapsedMs / 1000);
       setElapsedSeconds(elapsedSec);
@@ -77,7 +79,7 @@ export const LoadingScreen: React.FC<LoadingScreenProps> = ({
         const estimated = Math.min(95, Math.floor(10 + 85 * (1 - Math.exp(-t / 3.8))));
         setProgress(estimated);
       }
-    }, 100);
+    }, 1000);
 
     return () => clearInterval(timer);
   }, [startTime, isDone]);
@@ -208,6 +210,10 @@ export const LoadingScreen: React.FC<LoadingScreenProps> = ({
               <span className="w-1.5 h-2.5 bg-stone-900 rounded-full animate-bounce [animation-delay:250ms]"></span>
             </div>
           </div>
+
+          <button type="button" onClick={onCancel} className="mb-4 px-5 py-2 rounded-xl border-2 border-stone-900 bg-white font-bold text-stone-900 hover:bg-stone-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-stone-900">
+            추천 취소
+          </button>
 
           {/* User Request Feedback */}
           <div className="p-3 bg-stone-50 border border-stone-200 rounded-xl text-xs text-stone-600 text-left">
